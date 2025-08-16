@@ -21,7 +21,7 @@ Connect-ExchangeOnline
 # Get only user + shared mailboxes
 $mbxs = Get-ExoMailbox -ResultSize Unlimited `
         -RecipientTypeDetails UserMailbox,SharedMailbox `
-        -Properties DisplayName,PrimarySmtpAddress,EmailAddresses,RecipientTypeDetails
+        -Properties DisplayName,PrimarySmtpAddress,EmailAddresses,UserPrincipalName,RecipientTypeDetails
 
 Write-Host ("Found {0} mailboxes (user + shared)" -f $mbxs.Count) -ForegroundColor Cyan
 
@@ -49,13 +49,16 @@ foreach ($m in $mbxs) {
     }
 
     # Gather all SMTP addresses, primary + aliases
-    $allEmails = ($m.EmailAddresses | ForEach-Object {
+    $primaryEmail = $m.PrimarySmtpAddress
+    $aliases = ($m.EmailAddresses | Where-Object { $_ -ne "SMTP:$primaryEmail" } | ForEach-Object {
         ($_ -split ':')[1]
     } | Sort-Object -Unique) -join ';'
 
     $report += [PSCustomObject]@{
         DisplayName     = $m.DisplayName
-        EmailAddresses  = $allEmails
+        PrimaryEmail    = $primaryEmail
+        UPN             = $m.UserPrincipalName
+        Aliases         = $aliases
         MailboxSizeGB   = $sizeGB
         MailboxType     = $m.RecipientTypeDetails
     }
