@@ -101,13 +101,28 @@ function Write-Log {
     # Write to console
     Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
     
-    # Write to log file
+    # Write to log file with retry logic
     $logEntry = "[$timestamp] [$Level] $Message"
-    try {
-        Add-Content -Path $script:LogFile -Value $logEntry -ErrorAction Stop
-    }
-    catch {
-        Write-Host "[WARNING] Failed to write to log file: $($_.Exception.Message)" -ForegroundColor Yellow
+    $maxRetries = 3
+    $retryCount = 0
+    $success = $false
+    
+    while (-not $success -and $retryCount -lt $maxRetries) {
+        try {
+            Add-Content -Path $script:LogFile -Value $logEntry -ErrorAction Stop
+            $success = $true
+        }
+        catch {
+            $retryCount++
+            if ($retryCount -lt $maxRetries) {
+                # Wait with exponential backoff (1s, 2s, 4s)
+                Start-Sleep -Seconds ([Math]::Pow(2, $retryCount - 1))
+            }
+            else {
+                # Final retry failed, show warning
+                Write-Host "[WARNING] Failed to write to log file after $maxRetries attempts: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
     }
 }
 
