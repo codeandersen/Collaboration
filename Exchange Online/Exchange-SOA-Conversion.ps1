@@ -1,20 +1,48 @@
 #Requires -Version 5.1
 
 <#
-.SYNOPSIS
-    Exchange SOA Conversion tool
-.DESCRIPTION
-    GUI tool to manage Exchange mailbox Source of Authority (SOA) conversion between cloud-managed and on-premises-managed
-.NOTES
-    Author: Exchange SOA Conversion tool
-    Version: 1.0
-#>
+        .SYNOPSIS
+        Exchange SOA Conversion tool (Cloud / On-Prem Source of Authority)
+
+        .DESCRIPTION
+        GUI tool to manage Exchange mailbox Source of Authority (SOA) conversion between cloud-managed and on-premises-managed by toggling the mailbox property `IsExchangeCloudManaged`.
+        
+        The tool connects to Exchange Online PowerShell, lists directory-synced mailboxes (`IsDirSynced = True`), and supports converting one or multiple selected users in batch.
+        
+        This tool is intended to support the approach described in:
+        https://learn.microsoft.com/en-us/exchange/hybrid-deployment/enable-exchange-attributes-cloud-management
+
+        .EXAMPLE
+        C:\PS> .\Exchange-SOA-Conversion.ps1
+
+        .NOTES
+        Version: 1.0
+
+        .COPYRIGHT
+        MIT License, feel free to distribute and use as you like, please leave author information.
+
+       .LINK
+        https://learn.microsoft.com/en-us/exchange/hybrid-deployment/enable-exchange-attributes-cloud-management
+        
+        BLOG: http://www.hcandersen.dk
+        Twitter: @dk_hcandersen
+        LinkedIn: https://www.linkedin.com/in/hanschrandersen/
+
+        .DISCLAIMER
+        This script is provided AS-IS, with no warranty - Use at own risk.
+    #>
+
+$script:Version = "1.0"
+
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $script:ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:LogFile = Join-Path $script:ScriptPath "ExchangeCloudManagement_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
+$script:AllUsers = @()
+$script:CurrentPage = 1
+$script:PageSize = 100
 
 function Write-Log {
     param(
@@ -32,6 +60,46 @@ function Write-Log {
     Add-Content -Path $script:LogFile -Value $logEntry -Encoding UTF8
     
     Write-Host $logEntry
+}
+
+function Update-UserGrid {
+    param(
+        [Parameter(Mandatory=$false)]
+        [array]$Users = $script:AllUsers
+    )
+    
+    $script:AllUsers = $Users
+    $totalUsers = $script:AllUsers.Count
+    $totalPages = [Math]::Ceiling($totalUsers / $script:PageSize)
+    
+    if ($script:CurrentPage -gt $totalPages -and $totalPages -gt 0) {
+        $script:CurrentPage = $totalPages
+    }
+    
+    if ($script:CurrentPage -lt 1) {
+        $script:CurrentPage = 1
+    }
+    
+    $startIndex = ($script:CurrentPage - 1) * $script:PageSize
+    $endIndex = [Math]::Min($startIndex + $script:PageSize - 1, $totalUsers - 1)
+    
+    $dataGridView.Rows.Clear()
+    
+    if ($totalUsers -gt 0) {
+        for ($i = $startIndex; $i -le $endIndex; $i++) {
+            $user = $script:AllUsers[$i]
+            $cloudManagedStatus = if ($user.IsExchangeCloudManaged) { "True" } else { "False" }
+            $dataGridView.Rows.Add($user.DisplayName, $user.PrimarySmtpAddress, $cloudManagedStatus, $user.UserPrincipalName)
+        }
+        
+        $showingCount = $endIndex - $startIndex + 1
+        $pageInfo.Text = "Page $($script:CurrentPage) of $totalPages - Showing $showingCount of $totalUsers users"
+    } else {
+        $pageInfo.Text = "No users to display"
+    }
+    
+    $buttonPrevPage.Enabled = ($script:CurrentPage -gt 1)
+    $buttonNextPage.Enabled = ($script:CurrentPage -lt $totalPages)
 }
 
 function Search-ExchangeOnlineModule {
@@ -279,13 +347,8 @@ $buttonConnect.Add_Click({
         $users = Get-ExchangeUsers
         
         if ($users) {
-            $dataGridView.Rows.Clear()
-            
-            foreach ($user in $users) {
-                $cloudManagedStatus = if ($user.IsExchangeCloudManaged) { "True" } else { "False" }
-                $dataGridView.Rows.Add($user.DisplayName, $user.PrimarySmtpAddress, $cloudManagedStatus, $user.UserPrincipalName)
-            }
-            
+            $script:CurrentPage = 1
+            Update-UserGrid -Users $users
             $statusLabel.Text = "Connected - $($users.Count) users loaded"
         }
     }
@@ -312,13 +375,8 @@ $buttonRefresh.Add_Click({
     $users = Get-ExchangeUsers
     
     if ($users) {
-        $dataGridView.Rows.Clear()
-        
-        foreach ($user in $users) {
-            $cloudManagedStatus = if ($user.IsExchangeCloudManaged) { "True" } else { "False" }
-            $dataGridView.Rows.Add($user.DisplayName, $user.PrimarySmtpAddress, $cloudManagedStatus, $user.UserPrincipalName)
-        }
-        
+        $script:CurrentPage = 1
+        Update-UserGrid -Users $users
         $statusLabel.Text = "Refreshed - $($users.Count) users loaded"
     }
     
@@ -429,6 +487,57 @@ $colUserPrincipalName.Visible = $false
 [void]$dataGridView.Columns.Add($colUserPrincipalName)
 
 $form.Controls.Add($dataGridView)
+
+$buttonPrevPage = New-Object System.Windows.Forms.Button
+$buttonPrevPage.Location = New-Object System.Drawing.Point(20, 555)
+$buttonPrevPage.Size = New-Object System.Drawing.Size(100, 30)
+$buttonPrevPage.Text = "< Previous"
+$buttonPrevPage.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonPrevPage.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonPrevPage.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonPrevPage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$buttonPrevPage.FlatAppearance.BorderSize = 0
+$buttonPrevPage.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonPrevPage.Enabled = $false
+$buttonPrevPage.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$buttonPrevPage.Add_Click({
+    if ($script:CurrentPage -gt 1) {
+        $script:CurrentPage--
+        Update-UserGrid
+    }
+})
+$form.Controls.Add($buttonPrevPage)
+
+$pageInfo = New-Object System.Windows.Forms.Label
+$pageInfo.Location = New-Object System.Drawing.Point(130, 555)
+$pageInfo.Size = New-Object System.Drawing.Size(550, 30)
+$pageInfo.Text = "No users to display"
+$pageInfo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$pageInfo.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
+$pageInfo.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$pageInfo.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($pageInfo)
+
+$buttonNextPage = New-Object System.Windows.Forms.Button
+$buttonNextPage.Location = New-Object System.Drawing.Point(690, 555)
+$buttonNextPage.Size = New-Object System.Drawing.Size(100, 30)
+$buttonNextPage.Text = "Next >"
+$buttonNextPage.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonNextPage.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonNextPage.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonNextPage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$buttonNextPage.FlatAppearance.BorderSize = 0
+$buttonNextPage.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonNextPage.Enabled = $false
+$buttonNextPage.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$buttonNextPage.Add_Click({
+    $totalPages = [Math]::Ceiling($script:AllUsers.Count / $script:PageSize)
+    if ($script:CurrentPage -lt $totalPages) {
+        $script:CurrentPage++
+        Update-UserGrid
+    }
+})
+$form.Controls.Add($buttonNextPage)
 
 $buttonConvertToCloud = New-Object System.Windows.Forms.Button
 $buttonConvertToCloud.Location = New-Object System.Drawing.Point(20, 595)
@@ -622,7 +731,7 @@ $form.Controls.Add($statusLabel)
 $versionLabel = New-Object System.Windows.Forms.Label
 $versionLabel.Location = New-Object System.Drawing.Point(665, 615)
 $versionLabel.Size = New-Object System.Drawing.Size(315, 20)
-$versionLabel.Text = "Version 1.0"
+$versionLabel.Text = "Version $script:Version"
 $versionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
 $versionLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#808080")
 $versionLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
@@ -641,7 +750,13 @@ $form.Add_Resize({
     $versionY = $form.ClientSize.Height - 85
     $versionLabel.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 335), $versionY)
     
-    $gridHeight = $buttonY - 185
+    $paginationY = $buttonY - 40
+    $buttonPrevPage.Location = New-Object System.Drawing.Point(20, $paginationY)
+    $pageInfo.Location = New-Object System.Drawing.Point(130, $paginationY)
+    $pageInfo.Size = New-Object System.Drawing.Size(($form.ClientSize.Width - 270), 30)
+    $buttonNextPage.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 120), $paginationY)
+    
+    $gridHeight = $paginationY - 175
     $dataGridView.Size = New-Object System.Drawing.Size(($form.ClientSize.Width - 40), $gridHeight)
 })
 
