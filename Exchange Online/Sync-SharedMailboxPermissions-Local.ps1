@@ -1,28 +1,25 @@
 <#
 .SYNOPSIS
-    Automatically manages shared mailbox permissions based on group membership with SM- prefix.
+    Automatically manages shared mailbox permissions based on group membership with SM- prefix (Local version).
 
 .DESCRIPTION
     This script synchronizes permissions between Microsoft 365 groups and shared mailboxes.
     Groups with prefix "SMBX-xyz" will grant FullAccess (with automapping) to shared mailbox "xyz".
     Users added to the group get permissions, users removed lose permissions.
     
-    Uses Managed Identity for authentication (Azure Automation).
+    Uses interactive authentication for local execution.
 
 .PARAMETER GroupPrefix
     Prefix for groups that manage shared mailbox access. Default: "SMBX-"
-
-.PARAMETER Organization
-    Organization domain (e.g., contoso.onmicrosoft.com) - Required for Managed Identity
 
 .PARAMETER WhatIf
     If set to $true, shows what would be done without making any changes (dry-run mode)
 
 .EXAMPLE
-    .\Sync-SharedMailboxPermissions.ps1 -GroupPrefix "SMBX-" -Organization "contoso.onmicrosoft.com"
+    .\Sync-SharedMailboxPermissions-Local.ps1 -GroupPrefix "SMBX-"
 
 .EXAMPLE
-    .\Sync-SharedMailboxPermissions.ps1 -GroupPrefix "SMBX-" -Organization "contoso.onmicrosoft.com" -WhatIf $true
+    .\Sync-SharedMailboxPermissions-Local.ps1 -GroupPrefix "SMBX-" -WhatIf
 
 .NOTES
 
@@ -36,10 +33,7 @@ param (
     [string]$GroupPrefix = "SMBX-",
     
     [Parameter(Mandatory = $false)]
-    [string]$Organization = "lemu.onmicrosoft.com",
-    
-    [Parameter(Mandatory = $false)]
-    [switch]$WhatIf
+    [switch]$WhatIf = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,7 +54,7 @@ if ($module) {
     }
 }
 else {
-    Write-Error "ExchangeOnlineManagement module not found. Please install it in the Automation Account."
+    Write-Error "ExchangeOnlineManagement module not found. Please install it using: Install-Module -Name ExchangeOnlineManagement"
     exit 1
 }
 
@@ -69,16 +63,15 @@ else {
 function Connect-ExchangeOnlineAuth {
     <#
     .SYNOPSIS
-        Connects to Exchange Online using Managed Identity
+        Connects to Exchange Online using interactive authentication
     #>
     [CmdletBinding()]
     param()
     
     try {
-        Write-Output "Connecting to Exchange Online using Managed Identity..."
-        Write-Output "Organization: $Organization"
-        Connect-ExchangeOnline -ManagedIdentity -Organization $Organization -ShowBanner:$false -ErrorAction Stop
-        Write-Output "Successfully connected using Managed Identity"
+        Write-Output "Connecting to Exchange Online with interactive authentication..."
+        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop -DelegatedOrganization lemu.onmicrosoft.com
+        Write-Output "Successfully connected to Exchange Online"
     }
     catch {
         Write-Output "ERROR: Failed to connect to Exchange Online: $_"
@@ -121,10 +114,10 @@ function Add-SharedMailboxPermission {
                 -Confirm:$false `
                 -ErrorAction Stop | Out-Null
             
-            Write-Output "  [+] Successfully added $UserIdentity to $SharedMailboxIdentity (with automapping)"
+            Write-Host "  [+] Successfully added $UserIdentity to $SharedMailboxIdentity (with automapping)"
         }
         else {
-            Write-Output "  [WHATIF] Would add $UserIdentity to $SharedMailboxIdentity (with automapping)"
+            Write-Host "  [WHATIF] Would add $UserIdentity to $SharedMailboxIdentity (with automapping)"
         }
         return $true
     }
@@ -168,10 +161,10 @@ function Remove-SharedMailboxPermission {
                 -Confirm:$false `
                 -ErrorAction Stop | Out-Null
             
-            Write-Output "  [-] Successfully removed $UserIdentity from $SharedMailboxIdentity"
+            Write-Host "  [-] Successfully removed $UserIdentity from $SharedMailboxIdentity"
         }
         else {
-            Write-Output "  [WHATIF] Would remove $UserIdentity from $SharedMailboxIdentity"
+            Write-Host "  [WHATIF] Would remove $UserIdentity from $SharedMailboxIdentity"
         }
         return $true
     }
@@ -236,9 +229,9 @@ function Sync-SharedMailboxGroup {
         [bool]$WhatIfMode = $false
     )
     
-    Write-Output "DEBUG: Sync-SharedMailboxGroup function started"
-    Write-Output "DEBUG: GroupPrefix = $GroupPrefix"
-    Write-Output "DEBUG: WhatIfMode = $WhatIfMode"
+    Write-Host "DEBUG: Sync-SharedMailboxGroup function started"
+    Write-Host "DEBUG: GroupPrefix = $GroupPrefix"
+    Write-Host "DEBUG: WhatIfMode = $WhatIfMode"
     
     $stats = @{
         GroupsProcessed = 0
@@ -250,12 +243,11 @@ function Sync-SharedMailboxGroup {
         Operations = @()
     }
     
-    Write-Output "DEBUG: Stats object created"
+    Write-Host "DEBUG: Stats object created"
     
     try {
-        Write-Output ""
-        Write-Output "Searching for groups with prefix '$GroupPrefix'..."
-        #$groups = Get-DistributionGroup -Filter "Name -like '$GroupPrefix*'" -ResultSize Unlimited -ErrorAction Stop
+        Write-Host ""
+        Write-Host "Searching for groups with prefix '$GroupPrefix'..."
         $groups = Get-DistributionGroup -Filter "Name -like '$GroupPrefix*'" -ResultSize Unlimited -ErrorAction Stop
         
         if (-not $groups) {
@@ -263,8 +255,8 @@ function Sync-SharedMailboxGroup {
             return $stats
         }
         
-        Write-Output "Found $($groups.Count) group(s) to process"
-        Write-Output ""
+        Write-Host "Found $($groups.Count) group(s) to process"
+        Write-Host ""
         
         foreach ($group in $groups) {
             $stats.GroupsProcessed++
@@ -277,7 +269,7 @@ function Sync-SharedMailboxGroup {
                 $mailboxName = $mailboxName -replace '@.*$', ''
             }
             
-            Write-Output "[$($stats.GroupsProcessed)/$($groups.Count)] Processing: $($group.Name) -> Mailbox: $mailboxName"
+            Write-Host "[$($stats.GroupsProcessed)/$($groups.Count)] Processing: $($group.Name) -> Mailbox: $mailboxName"
             
             try {
                 $sharedMailbox = Get-Mailbox -Filter "Name -eq '$mailboxName' -or Alias -eq '$mailboxName'" -ErrorAction Stop | Select-Object -First 1
@@ -315,9 +307,9 @@ function Sync-SharedMailboxGroup {
             Write-Verbose "  Mailbox has $($currentDelegates.Count) delegate(s)"
             
             if ($groupMembers.Count -eq 0 -and $currentDelegates.Count -gt 0) {
-                Write-Output "  [!] Group is empty. Removing all explicit permissions..."
+                Write-Host "  [!] Group is empty. Removing all explicit permissions..."
                 foreach ($delegate in $currentDelegates) {
-                    Write-Output "  [-] Removing $delegate from $sharedMailboxUPN"
+                    Write-Host "  [-] Removing $delegate from $sharedMailboxUPN"
                     if (Remove-SharedMailboxPermission -UserIdentity $delegate -SharedMailboxIdentity $sharedMailboxUPN -WhatIfMode $WhatIfMode) {
                         $stats.PermissionsRemoved++
                         $stats.Operations += "REMOVED: $delegate from $mailboxName"
@@ -328,9 +320,9 @@ function Sync-SharedMailboxGroup {
                 }
             }
             elseif ($currentDelegates.Count -eq 0 -and $groupMembers.Count -gt 0) {
-                Write-Output "  [!] No existing permissions. Adding all group members..."
+                Write-Host "  [!] No existing permissions. Adding all group members..."
                 foreach ($member in $groupMembers) {
-                    Write-Output "  [+] Adding $member to $sharedMailboxUPN"
+                    Write-Host "  [+] Adding $member to $sharedMailboxUPN"
                     if (Add-SharedMailboxPermission -UserIdentity $member -SharedMailboxIdentity $sharedMailboxUPN -WhatIfMode $WhatIfMode) {
                         $stats.PermissionsAdded++
                         $stats.Operations += "ADDED: $member to $mailboxName"
@@ -346,7 +338,7 @@ function Sync-SharedMailboxGroup {
                 if ($comparison) {
                     $usersToAdd = $comparison | Where-Object { $_.SideIndicator -eq "=>" } | Select-Object -ExpandProperty InputObject
                     foreach ($user in $usersToAdd) {
-                        Write-Output "  [+] Adding $user to $sharedMailboxUPN"
+                        Write-Host "  [+] Adding $user to $sharedMailboxUPN"
                         if (Add-SharedMailboxPermission -UserIdentity $user -SharedMailboxIdentity $sharedMailboxUPN -WhatIfMode $WhatIfMode) {
                             $stats.PermissionsAdded++
                             $stats.Operations += "ADDED: $user to $mailboxName"
@@ -358,7 +350,7 @@ function Sync-SharedMailboxGroup {
                     
                     $usersToRemove = $comparison | Where-Object { $_.SideIndicator -eq "<=" } | Select-Object -ExpandProperty InputObject
                     foreach ($user in $usersToRemove) {
-                        Write-Output "  [-] Removing $user from $sharedMailboxUPN"
+                        Write-Host "  [-] Removing $user from $sharedMailboxUPN"
                         if (Remove-SharedMailboxPermission -UserIdentity $user -SharedMailboxIdentity $sharedMailboxUPN -WhatIfMode $WhatIfMode) {
                             $stats.PermissionsRemoved++
                             $stats.Operations += "REMOVED: $user from $mailboxName"
@@ -369,17 +361,17 @@ function Sync-SharedMailboxGroup {
                     }
                 }
                 else {
-                    Write-Output "  [=] Permissions already in sync"
+                    Write-Host "  [=] Permissions already in sync"
                 }
             }
             
-            Write-Output ""
+            Write-Host ""
         }
     }
     catch {
-        Write-Output "ERROR: Critical error during sync: $_"
-        Write-Output "ERROR: Exception Type: $($_.Exception.GetType().FullName)"
-        Write-Output "ERROR: Stack Trace: $($_.ScriptStackTrace)"
+        Write-Host "ERROR: Critical error during sync: $_"
+        Write-Host "ERROR: Exception Type: $($_.Exception.GetType().FullName)"
+        Write-Host "ERROR: Stack Trace: $($_.ScriptStackTrace)"
         $stats.Errors++
     }
     
@@ -393,6 +385,7 @@ function Sync-SharedMailboxGroup {
 try {
     Write-Output "========================================"
     Write-Output "Shared Mailbox Permission Sync Script"
+    Write-Output "(Local Interactive Version)"
     if ($WhatIf) {
         Write-Output "*** WHATIF MODE - NO CHANGES WILL BE MADE ***"
     }
@@ -408,7 +401,7 @@ try {
     Write-Output "Parameters: GroupPrefix='$GroupPrefix', WhatIfMode='$WhatIf'"
     
     try {
-        $results = Sync-SharedMailboxGroup -GroupPrefix $GroupPrefix -WhatIfMode $WhatIf.IsPresent -ErrorAction Stop | Select-Object -Last 1
+        $results = Sync-SharedMailboxGroup -GroupPrefix $GroupPrefix -WhatIfMode $WhatIf.IsPresent -ErrorAction Stop
         Write-Output "Sync-SharedMailboxGroup function returned"
         
         if ($null -eq $results) {
