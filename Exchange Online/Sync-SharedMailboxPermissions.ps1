@@ -36,7 +36,7 @@ param (
     [string]$GroupPrefix = "SMBX-",
     
     [Parameter(Mandatory = $false)]
-    [string]$Organization = "lemu.onmicrosoft.com",
+    [string]$Organization = "",
     
     [Parameter(Mandatory = $false)]
     [switch]$WhatIf
