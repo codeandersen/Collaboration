@@ -145,7 +145,7 @@ try {
     $allRecipients += $mailUsers
     Write-Host "      Found: $($mailUsers.Count) mail users" -ForegroundColor Green
     
-    Write-Host "[7/7] Collecting Microsoft 365 Groups..." -ForegroundColor Yellow
+    Write-Host "[7/8] Collecting Microsoft 365 Groups..." -ForegroundColor Yellow
     $m365Groups = Get-UnifiedGroup -ResultSize Unlimited | Select-Object `
         @{N='RecipientType';E={'Microsoft365Group'}},
         DisplayName,
@@ -162,6 +162,24 @@ try {
     
     $allRecipients += $m365Groups
     Write-Host "      Found: $($m365Groups.Count) Microsoft 365 groups" -ForegroundColor Green
+    
+    Write-Host "[8/8] Collecting Mail-Enabled Public Folders..." -ForegroundColor Yellow
+    $mailPublicFolders = Get-MailPublicFolder -ResultSize Unlimited | Select-Object `
+        @{N='RecipientType';E={'MailPublicFolder'}},
+        DisplayName,
+        PrimarySmtpAddress,
+        Alias,
+        RecipientTypeDetails,
+        @{N='EmailAddresses';E={($_.EmailAddresses | Where-Object {$_ -like "smtp:*"}) -join ';'}},
+        @{N='Database';E={'N/A'}},
+        @{N='ServerName';E={'N/A'}},
+        @{N='ArchiveStatus';E={'N/A'}},
+        @{N='IsRemote';E={$false}},
+        @{N='OrganizationalUnit';E={if($_.DistinguishedName){($_.DistinguishedName -replace '^CN=.+?,((?:OU|CN)=.+)','$1') -replace ',DC=.*$',''}else{'N/A - Cloud Only'}}},
+        DistinguishedName
+    
+    $allRecipients += $mailPublicFolders
+    Write-Host "      Found: $($mailPublicFolders.Count) mail-enabled public folders" -ForegroundColor Green
     
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
