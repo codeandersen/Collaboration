@@ -101,8 +101,6 @@ try {
     }
     
     if ($publicFolders.Count -gt 0) {
-        $warnings += "Found $($publicFolders.Count) mail-enabled public folders - these need to be synchronized as MailUser objects in Exchange Online"
-        
         $pfSyncedCount = 0
         foreach ($pf in $publicFolders) {
             $pfEmail = $pf.PrimarySmtpAddress.ToLower()
@@ -113,9 +111,10 @@ try {
         
         if ($pfSyncedCount -lt $publicFolders.Count) {
             $canEnableEdgeBlocking = $false
-            $blockers += "Only $pfSyncedCount of $($publicFolders.Count) public folders are synchronized to Exchange Online"
+            $blockers += "Only $pfSyncedCount of $($publicFolders.Count) mail-enabled public folders are synchronized to Exchange Online (missing: $($publicFolders.Count - $pfSyncedCount))"
+            $warnings += "Run Sync-MailPublicFolders.ps1 to synchronize the missing public folders"
         } else {
-            $warnings += "All public folders are synchronized to Exchange Online - edge blocking is possible"
+            $warnings += "Found $($publicFolders.Count) mail-enabled public folders - all are synchronized to Exchange Online ✅"
         }
     }
     
