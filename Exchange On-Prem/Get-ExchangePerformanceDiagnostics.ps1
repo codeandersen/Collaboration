@@ -486,85 +486,10 @@ function New-HTMLReport {
                 <div class="metric-value status-$($perf.Memory.Status.ToLower())">$(if ($perf.Memory.CommittedBytesPercent -eq 'N/A') { 'N/A' } else { "$($perf.Memory.CommittedBytesPercent)%" })</div>
                 <div class="metric-label">Available: $(if ($perf.Memory.AvailableMB -eq 'N/A') { 'N/A' } else { "$($perf.Memory.AvailableMB) MB" })</div>
             </div>
-        </div>
-        
-        <h3>Logical Disk Performance</h3>
-        <div style="overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
-                <thead>
-                    <tr style="background-color: #0078d4; color: white;">
-                        <th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Drive</th>
-                        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Read Latency</th>
-                        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Write Latency</th>
-                        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Queue Length</th>
-                        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Disk Time %</th>
-                        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Free Space</th>
-                        <th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-"@
-            if ($perf.Disk.Drives -and $perf.Disk.Drives.Count -gt 0) {
-                foreach ($drive in $perf.Disk.Drives) {
-                    $statusClass = switch ($drive.Status) {
-                        'Healthy' { 'status-healthy' }
-                        'Warning' { 'status-warning' }
-                        'Critical' { 'status-critical' }
-                        default { '' }
-                    }
-                    $html += @"
-                    <tr>
-                        <td style="padding: 10px; border: 1px solid #ddd; font-weight: bold;">$($drive.Drive)</td>
-                        <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">$($drive.ReadLatencyMs) ms</td>
-                        <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">$($drive.WriteLatencyMs) ms</td>
-                        <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">$($drive.QueueLength)</td>
-                        <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">$($drive.DiskTimePercent)%</td>
-                        <td style="padding: 10px; border: 1px solid #ddd; text-align: center;">$($drive.FreeSpacePercent)% ($($drive.FreeMB) MB)</td>
-                        <td style="padding: 10px; border: 1px solid #ddd; text-align: center;" class="$statusClass">$($drive.Status)</td>
-                    </tr>
-"@
-                    if ($drive.Issues) {
-                        $html += @"
-                    <tr>
-                        <td colspan="7" style="padding: 5px 10px; border: 1px solid #ddd; background-color: #fff3cd; font-size: 12px;">
-                            <strong>Issues:</strong> $($drive.Issues)
-                        </td>
-                    </tr>
-"@
-                    }
-                }
-            } else {
-                $html += @"
-                    <tr>
-                        <td colspan="7" style="padding: 10px; border: 1px solid #ddd; text-align: center;">No disk performance data available</td>
-                    </tr>
-"@
-            }
-            $html += @"
-                </tbody>
-            </table>
-        </div>
-        
-        <div class="metric-grid">
             <div class="metric-card">
-                <div class="metric-label">Network - Packets Discarded</div>
-                <div class="metric-value status-$($perf.Network.Status.ToLower())">$(if ($perf.Network.PacketsDiscarded -eq 'N/A') { 'N/A' } else { "$($perf.Network.PacketsDiscarded)" })</div>
-                <div class="metric-label">Threshold: 10 (Warning), 100 (Critical)</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Network - Outbound Errors</div>
-                <div class="metric-value status-$($perf.Network.Status.ToLower())">$(if ($perf.Network.OutboundErrors -eq 'N/A') { 'N/A' } else { "$($perf.Network.OutboundErrors)" })</div>
-                <div class="metric-label">Threshold: 10 (Warning), 50 (Critical)</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">TCP Segments Retransmitted/sec</div>
-                <div class="metric-value status-$($perf.Network.Status.ToLower())">$(if ($perf.Network.TCPRetransmits -eq 'N/A') { 'N/A' } else { "$($perf.Network.TCPRetransmits)" })</div>
-                <div class="metric-label">Threshold: 5/sec (Warning), 10/sec (Critical)</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Network Throughput</div>
-                <div class="metric-value">$(if ($perf.Network.BytesTotal -eq 'N/A') { 'N/A' } else { "$([math]::Round($perf.Network.BytesTotal / 1MB, 2)) MB/sec" })</div>
-                <div class="metric-label">Queue Length: $(if ($perf.Network.OutputQueueLength -eq 'N/A') { 'N/A' } else { "$($perf.Network.OutputQueueLength)" })</div>
+                <div class="metric-label">Disk Latency$(if ($perf.Disk.Source -eq 'LogicalDisk') { ' (LogicalDisk)' } elseif ($perf.Disk.Source -eq 'ExchangeDatabase') { ' (DB Counters)' })</div>
+                <div class="metric-value status-$($perf.Disk.Status.ToLower())">R: $(if ($perf.Disk.DatabaseReadLatency -eq 'N/A') { 'N/A' } else { "$($perf.Disk.DatabaseReadLatency)ms" }) / W: $(if ($perf.Disk.DatabaseWriteLatency -eq 'N/A') { 'N/A' } else { "$($perf.Disk.DatabaseWriteLatency)ms" })</div>
+                <div class="metric-label">Log Write: $(if ($perf.Disk.LogWriteLatency -eq 'N/A' -or ($perf.Disk.Source -eq 'LogicalDisk' -and $perf.Disk.LogWriteLatency -eq 0)) { 'N/A' } else { "$($perf.Disk.LogWriteLatency)ms" })</div>
             </div>
         </div>
 "@
@@ -821,24 +746,11 @@ $counterGroups = @{
         '\LogicalDisk(*)\Avg. Disk sec/Read'
         '\LogicalDisk(*)\Avg. Disk sec/Write'
         '\LogicalDisk(*)\Current Disk Queue Length'
-        '\LogicalDisk(*)\% Disk Time'
-        '\LogicalDisk(*)\% Free Space'
-        '\LogicalDisk(*)\Free Megabytes'
     )
     'ExchangeRPC' = @(
         '\MSExchange RpcClientAccess\RPC Averaged Latency'
         '\MSExchange RpcClientAccess\RPC Requests'
         '\MSExchange RpcClientAccess\RPC Operations/sec'
-    )
-    'Network' = @(
-        '\Network Interface(*)\Packets Received Discarded'
-        '\Network Interface(*)\Packets Outbound Errors'
-        '\TCPv4\Segments Retransmitted/sec'
-        '\Network Interface(*)\Bytes Total/sec'
-        '\Network Interface(*)\Output Queue Length'
-        '\Network Interface(*)\Packets Received Errors'
-        '\TCPv4\Connection Failures'
-        '\Network Interface(*)\Current Bandwidth'
     )
 }
 
@@ -1116,144 +1028,77 @@ foreach ($serverName in $Servers) {
                 $perfData.Memory = @{ AvailableMB = 'N/A'; CommittedBytesPercent = 'N/A'; Status = 'NotAvailable' }
             }
             
-            $diskReadSamples = $allSamples | Where-Object { $_.Path -like '*LogicalDisk*Avg. Disk sec/Read*' -and $_.Path -notlike '*_Total*' }
-            $diskWriteSamples = $allSamples | Where-Object { $_.Path -like '*LogicalDisk*Avg. Disk sec/Write*' -and $_.Path -notlike '*_Total*' }
-            $diskQueueSamples = $allSamples | Where-Object { $_.Path -like '*LogicalDisk*Current Disk Queue Length*' -and $_.Path -notlike '*_Total*' }
-            $diskTimeSamples = $allSamples | Where-Object { $_.Path -like '*LogicalDisk*% Disk Time*' -and $_.Path -notlike '*_Total*' }
-            $diskFreeSpaceSamples = $allSamples | Where-Object { $_.Path -like '*LogicalDisk*% Free Space*' -and $_.Path -notlike '*_Total*' }
-            $diskFreeMBSamples = $allSamples | Where-Object { $_.Path -like '*LogicalDisk*Free Megabytes*' -and $_.Path -notlike '*_Total*' }
+            # Try Exchange Database-specific counters first (values already in ms)
+            $dbReadSamples = $allSamples | Where-Object { $_.Path -like '*I/O Database Reads*Latency*' -and $_.CookedValue -ge 0 }
+            $dbWriteSamples = $allSamples | Where-Object { $_.Path -like '*I/O Database Writes*Latency*' -and $_.CookedValue -ge 0 }
+            $logWriteSamples = $allSamples | Where-Object { $_.Path -like '*I/O Log Writes*Latency*' -and $_.CookedValue -ge 0 }
             
-            if ($diskReadSamples -or $diskWriteSamples) {
-                # Get unique drive letters
-                $drives = $diskReadSamples | ForEach-Object { 
-                    if ($_.Path -match '\\LogicalDisk\(([^)]+)\)\\') { $matches[1] }
-                } | Select-Object -Unique | Where-Object { $_ -ne '_Total' }
-                
-                $diskDetails = @()
-                $worstStatus = 'Healthy'
-                
-                foreach ($drive in $drives) {
-                    $driveReadLatency = ($diskReadSamples | Where-Object { $_.Path -like "*($drive)*" } | Measure-Object -Property CookedValue -Average).Average
-                    $driveWriteLatency = ($diskWriteSamples | Where-Object { $_.Path -like "*($drive)*" } | Measure-Object -Property CookedValue -Average).Average
-                    $driveQueueLength = ($diskQueueSamples | Where-Object { $_.Path -like "*($drive)*" } | Measure-Object -Property CookedValue -Average).Average
-                    $driveDiskTime = ($diskTimeSamples | Where-Object { $_.Path -like "*($drive)*" } | Measure-Object -Property CookedValue -Average).Average
-                    $driveFreeSpacePercent = ($diskFreeSpaceSamples | Where-Object { $_.Path -like "*($drive)*" } | Measure-Object -Property CookedValue -Average).Average
-                    $driveFreeMB = ($diskFreeMBSamples | Where-Object { $_.Path -like "*($drive)*" } | Measure-Object -Property CookedValue -Average).Average
-                    
-                    # Convert latency from seconds to milliseconds
-                    $readLatencyMs = if ($driveReadLatency) { [math]::Round($driveReadLatency * 1000, 2) } else { 0 }
-                    $writeLatencyMs = if ($driveWriteLatency) { [math]::Round($driveWriteLatency * 1000, 2) } else { 0 }
-                    
-                    $driveStatus = 'Healthy'
-                    $driveIssues = @()
-                    
-                    # Check latency thresholds
-                    if ($readLatencyMs -gt 50 -or $writeLatencyMs -gt 50) {
-                        $driveStatus = 'Critical'
-                        $driveIssues += "High latency (R: ${readLatencyMs}ms, W: ${writeLatencyMs}ms)"
-                    } elseif ($readLatencyMs -gt 20 -or $writeLatencyMs -gt 20) {
-                        $driveStatus = 'Warning'
-                        $driveIssues += "Elevated latency (R: ${readLatencyMs}ms, W: ${writeLatencyMs}ms)"
-                    }
-                    
-                    # Check disk queue length
-                    if ($driveQueueLength -gt 10) {
-                        if ($driveStatus -ne 'Critical') { $driveStatus = 'Critical' }
-                        $driveIssues += "High queue length ($([math]::Round($driveQueueLength, 1)))"
-                    } elseif ($driveQueueLength -gt 5) {
-                        if ($driveStatus -eq 'Healthy') { $driveStatus = 'Warning' }
-                        $driveIssues += "Elevated queue length ($([math]::Round($driveQueueLength, 1)))"
-                    }
-                    
-                    # Check disk time
-                    if ($driveDiskTime -gt 90) {
-                        if ($driveStatus -ne 'Critical') { $driveStatus = 'Critical' }
-                        $driveIssues += "Disk very busy ($([math]::Round($driveDiskTime, 1))%)"
-                    } elseif ($driveDiskTime -gt 80) {
-                        if ($driveStatus -eq 'Healthy') { $driveStatus = 'Warning' }
-                        $driveIssues += "Disk busy ($([math]::Round($driveDiskTime, 1))%)"
-                    }
-                    
-                    # Check free space
-                    if ($driveFreeSpacePercent -lt 10) {
-                        if ($driveStatus -ne 'Critical') { $driveStatus = 'Critical' }
-                        $driveIssues += "Low disk space ($([math]::Round($driveFreeSpacePercent, 1))% free)"
-                    } elseif ($driveFreeSpacePercent -lt 20) {
-                        if ($driveStatus -eq 'Healthy') { $driveStatus = 'Warning' }
-                        $driveIssues += "Disk space low ($([math]::Round($driveFreeSpacePercent, 1))% free)"
-                    }
-                    
-                    # Update worst status
-                    if ($driveStatus -eq 'Critical') { $worstStatus = 'Critical' }
-                    elseif ($driveStatus -eq 'Warning' -and $worstStatus -ne 'Critical') { $worstStatus = 'Warning' }
-                    
-                    # Log issues
-                    if ($driveIssues.Count -gt 0) {
-                        $issueLevel = if ($driveStatus -eq 'Critical') { 'Error' } else { 'Warning' }
-                        Write-DiagnosticLog "  Drive ${drive}: $($driveIssues -join ', ')" -Level $issueLevel
-                        if ($driveStatus -eq 'Critical') {
-                            $perfData.Issues += "CRITICAL: Drive ${drive} - $($driveIssues -join ', ')"
-                            $Script:DiagnosticResults.Summary.CriticalIssues++
-                        } else {
-                            $perfData.Issues += "WARNING: Drive ${drive} - $($driveIssues -join ', ')"
-                            $Script:DiagnosticResults.Summary.Warnings++
-                        }
-                    }
-                    
-                    $diskDetails += [PSCustomObject]@{
-                        Drive = $drive
-                        ReadLatencyMs = $readLatencyMs
-                        WriteLatencyMs = $writeLatencyMs
-                        QueueLength = [math]::Round($driveQueueLength, 2)
-                        DiskTimePercent = [math]::Round($driveDiskTime, 1)
-                        FreeSpacePercent = [math]::Round($driveFreeSpacePercent, 1)
-                        FreeMB = [math]::Round($driveFreeMB, 0)
-                        Status = $driveStatus
-                        Issues = $driveIssues -join '; '
-                    }
-                }
-                
-                $perfData.Disk = @{
-                    Drives = $diskDetails
-                    Status = $worstStatus
-                }
+            $diskSource = $null
+            $dbReadLatency = 0
+            $dbWriteLatency = 0
+            $logWriteLatency = 0
+            
+            if ($dbReadSamples -or $dbWriteSamples -or $logWriteSamples) {
+                # Exchange Database counters available (values in ms)
+                $diskSource = 'ExchangeDatabase'
+                $dbReadLatency = if ($dbReadSamples) { ($dbReadSamples | Measure-Object -Property CookedValue -Average).Average } else { 0 }
+                $dbWriteLatency = if ($dbWriteSamples) { ($dbWriteSamples | Measure-Object -Property CookedValue -Average).Average } else { 0 }
+                $logWriteLatency = if ($logWriteSamples) { ($logWriteSamples | Measure-Object -Property CookedValue -Average).Average } else { 0 }
+                Write-DiagnosticLog "  Using Exchange Database counters for disk latency" -Level Info
             } else {
-                $perfData.Disk = @{ Drives = @(); Status = 'NotAvailable' }
+                # Fallback: use LogicalDisk Avg. Disk sec/Read|Write counters (values in seconds, convert to ms)
+                # Try per-drive first (exclude _Total), fall back to _Total if no per-drive found
+                $ldReadSamples = $allSamples | Where-Object { $_.Path -like '*avg. disk sec/read*' -and $_.Path -notlike '*_total*' }
+                $ldWriteSamples = $allSamples | Where-Object { $_.Path -like '*avg. disk sec/write*' -and $_.Path -notlike '*_total*' }
+                
+                # If no per-drive samples, try including _Total
+                if (-not $ldReadSamples -and -not $ldWriteSamples) {
+                    $ldReadSamples = $allSamples | Where-Object { $_.Path -like '*avg. disk sec/read*' }
+                    $ldWriteSamples = $allSamples | Where-Object { $_.Path -like '*avg. disk sec/write*' }
+                }
+                
+                if ($ldReadSamples -or $ldWriteSamples) {
+                    $diskSource = 'LogicalDisk'
+                    # Convert from seconds to milliseconds
+                    $dbReadLatency = if ($ldReadSamples) { ($ldReadSamples | Measure-Object -Property CookedValue -Average).Average * 1000 } else { 0 }
+                    $dbWriteLatency = if ($ldWriteSamples) { ($ldWriteSamples | Measure-Object -Property CookedValue -Average).Average * 1000 } else { 0 }
+                    $logWriteLatency = 0
+                    Write-DiagnosticLog "  Using LogicalDisk counters for disk latency (Exchange DB counters not available)" -Level Info
+                } else {
+                    Write-DiagnosticLog "  No disk latency samples found in $($allSamples.Count) total samples" -Level Warning
+                }
             }
             
-            $networkDiscardedSamples = $allSamples | Where-Object { $_.Path -like '*Packets Received Discarded*' }
-            $networkOutboundErrorSamples = $allSamples | Where-Object { $_.Path -like '*Packets Outbound Errors*' }
-            $tcpRetransmitSamples = $allSamples | Where-Object { $_.Path -like '*Segments Retransmitted/sec*' }
-            $networkBytesSamples = $allSamples | Where-Object { $_.Path -like '*Bytes Total/sec*' }
-            $networkQueueSamples = $allSamples | Where-Object { $_.Path -like '*Output Queue Length*' }
-            
-            if ($networkDiscardedSamples -or $networkOutboundErrorSamples -or $tcpRetransmitSamples) {
-                $packetsDiscarded = if ($networkDiscardedSamples) { ($networkDiscardedSamples | Measure-Object -Property CookedValue -Sum).Sum } else { 0 }
-                $outboundErrors = if ($networkOutboundErrorSamples) { ($networkOutboundErrorSamples | Measure-Object -Property CookedValue -Sum).Sum } else { 0 }
-                $tcpRetransmits = if ($tcpRetransmitSamples) { ($tcpRetransmitSamples | Measure-Object -Property CookedValue -Average).Average } else { 0 }
-                $bytesTotal = if ($networkBytesSamples) { ($networkBytesSamples | Measure-Object -Property CookedValue -Average).Average } else { 0 }
-                $outputQueue = if ($networkQueueSamples) { ($networkQueueSamples | Measure-Object -Property CookedValue -Average).Average } else { 0 }
-                
-                $perfData.Network = @{
-                    PacketsDiscarded = [math]::Round($packetsDiscarded, 0)
-                    OutboundErrors = [math]::Round($outboundErrors, 0)
-                    TCPRetransmits = [math]::Round($tcpRetransmits, 2)
-                    BytesTotal = [math]::Round($bytesTotal, 0)
-                    OutputQueueLength = [math]::Round($outputQueue, 2)
+            if ($null -ne $diskSource) {
+                $perfData.Disk = @{
+                    DatabaseReadLatency = [math]::Round($dbReadLatency, 2)
+                    DatabaseWriteLatency = [math]::Round($dbWriteLatency, 2)
+                    LogWriteLatency = [math]::Round($logWriteLatency, 2)
+                    Source = $diskSource
                     Status = 'Healthy'
                 }
                 
-                if ($packetsDiscarded -gt 100 -or $outboundErrors -gt 50 -or $tcpRetransmits -gt 10) {
-                    $perfData.Network.Status = 'Critical'
+                if ($dbReadLatency -gt 50 -or $dbWriteLatency -gt 50) {
+                    $perfData.Disk.Status = 'Critical'
+                    $perfData.Issues += "CRITICAL: Disk latency exceeds 50ms (Read: $([math]::Round($dbReadLatency, 2))ms, Write: $([math]::Round($dbWriteLatency, 2))ms)"
                     $Script:DiagnosticResults.Summary.CriticalIssues++
-                    Write-DiagnosticLog "  Network performance critical on $serverName - Discarded: $packetsDiscarded, Errors: $outboundErrors, Retransmits: $tcpRetransmits/sec" -Level Error
-                } elseif ($packetsDiscarded -gt 10 -or $outboundErrors -gt 10 -or $tcpRetransmits -gt 5) {
-                    $perfData.Network.Status = 'Warning'
+                } elseif ($dbReadLatency -gt 20 -or $dbWriteLatency -gt 20) {
+                    $perfData.Disk.Status = 'Warning'
+                    $perfData.Issues += "WARNING: Disk latency exceeds 20ms (Read: $([math]::Round($dbReadLatency, 2))ms, Write: $([math]::Round($dbWriteLatency, 2))ms)"
                     $Script:DiagnosticResults.Summary.Warnings++
-                    Write-DiagnosticLog "  Network performance degraded on $serverName - Discarded: $packetsDiscarded, Errors: $outboundErrors, Retransmits: $tcpRetransmits/sec" -Level Warning
+                }
+                
+                if ($logWriteLatency -gt 50) {
+                    $perfData.Disk.Status = 'Critical'
+                    $perfData.Issues += "CRITICAL: Log disk write latency is $([math]::Round($logWriteLatency, 2))ms (threshold: 50ms)"
+                    $Script:DiagnosticResults.Summary.CriticalIssues++
+                } elseif ($logWriteLatency -gt 10) {
+                    if ($perfData.Disk.Status -ne 'Critical') { $perfData.Disk.Status = 'Warning' }
+                    $perfData.Issues += "WARNING: Log disk write latency is $([math]::Round($logWriteLatency, 2))ms (threshold: 10ms)"
+                    $Script:DiagnosticResults.Summary.Warnings++
                 }
             } else {
-                $perfData.Network = @{ PacketsDiscarded = 'N/A'; OutboundErrors = 'N/A'; TCPRetransmits = 'N/A'; BytesTotal = 'N/A'; OutputQueueLength = 'N/A'; Status = 'NotAvailable' }
+                $perfData.Disk = @{ DatabaseReadLatency = 'N/A'; DatabaseWriteLatency = 'N/A'; LogWriteLatency = 'N/A'; Source = 'None'; Status = 'NotAvailable' }
             }
             
             $perfData.Status = 'Collected'
@@ -1318,64 +1163,20 @@ Write-DiagnosticLog "HTML report saved to: $reportPath" -Level Success
 $csvData = @()
 foreach ($server in $Script:DiagnosticResults.Servers) {
     if ($server.PerformanceCounters -and $server.PerformanceCounters.Status -eq 'Collected') {
-        # Export per-drive disk metrics
-        if ($server.PerformanceCounters.Disk.Drives -and $server.PerformanceCounters.Disk.Drives.Count -gt 0) {
-            foreach ($drive in $server.PerformanceCounters.Disk.Drives) {
-                $csvData += [PSCustomObject]@{
-                    Timestamp = $Script:DiagnosticResults.Timestamp
-                    ServerName = $server.ServerName
-                    Drive = $drive.Drive
-                    DiskReadLatencyMs = $drive.ReadLatencyMs
-                    DiskWriteLatencyMs = $drive.WriteLatencyMs
-                    DiskQueueLength = $drive.QueueLength
-                    DiskTimePercent = $drive.DiskTimePercent
-                    DiskFreeSpacePercent = $drive.FreeSpacePercent
-                    DiskFreeMB = $drive.FreeMB
-                    DiskStatus = $drive.Status
-                    DiskIssues = $drive.Issues
-                    RPCLatency = $server.PerformanceCounters.RPC.AverageLatency
-                    RPCStatus = $server.PerformanceCounters.RPC.Status
-                    CPUUsage = $server.PerformanceCounters.CPU.AverageUsage
-                    CPUStatus = $server.PerformanceCounters.CPU.Status
-                    MemoryCommitted = $server.PerformanceCounters.Memory.CommittedBytesPercent
-                    MemoryAvailableMB = $server.PerformanceCounters.Memory.AvailableMB
-                    MemoryStatus = $server.PerformanceCounters.Memory.Status
-                    NetworkPacketsDiscarded = $server.PerformanceCounters.Network.PacketsDiscarded
-                    NetworkOutboundErrors = $server.PerformanceCounters.Network.OutboundErrors
-                    TCPSegmentsRetransmitted = $server.PerformanceCounters.Network.TCPRetransmits
-                    NetworkBytesTotal = $server.PerformanceCounters.Network.BytesTotal
-                    NetworkOutputQueueLength = $server.PerformanceCounters.Network.OutputQueueLength
-                    NetworkStatus = $server.PerformanceCounters.Network.Status
-                }
-            }
-        } else {
-            # No disk data, export server-level metrics only
-            $csvData += [PSCustomObject]@{
-                Timestamp = $Script:DiagnosticResults.Timestamp
-                ServerName = $server.ServerName
-                Drive = 'N/A'
-                DiskReadLatencyMs = 'N/A'
-                DiskWriteLatencyMs = 'N/A'
-                DiskQueueLength = 'N/A'
-                DiskTimePercent = 'N/A'
-                DiskFreeSpacePercent = 'N/A'
-                DiskFreeMB = 'N/A'
-                DiskStatus = $server.PerformanceCounters.Disk.Status
-                DiskIssues = 'N/A'
-                RPCLatency = $server.PerformanceCounters.RPC.AverageLatency
-                RPCStatus = $server.PerformanceCounters.RPC.Status
-                CPUUsage = $server.PerformanceCounters.CPU.AverageUsage
-                CPUStatus = $server.PerformanceCounters.CPU.Status
-                MemoryCommitted = $server.PerformanceCounters.Memory.CommittedBytesPercent
-                MemoryAvailableMB = $server.PerformanceCounters.Memory.AvailableMB
-                MemoryStatus = $server.PerformanceCounters.Memory.Status
-                NetworkPacketsDiscarded = $server.PerformanceCounters.Network.PacketsDiscarded
-                NetworkOutboundErrors = $server.PerformanceCounters.Network.OutboundErrors
-                TCPSegmentsRetransmitted = $server.PerformanceCounters.Network.TCPRetransmits
-                NetworkBytesTotal = $server.PerformanceCounters.Network.BytesTotal
-                NetworkOutputQueueLength = $server.PerformanceCounters.Network.OutputQueueLength
-                NetworkStatus = $server.PerformanceCounters.Network.Status
-            }
+        $csvData += [PSCustomObject]@{
+            Timestamp = $Script:DiagnosticResults.Timestamp
+            ServerName = $server.ServerName
+            RPCLatency = $server.PerformanceCounters.RPC.AverageLatency
+            RPCStatus = $server.PerformanceCounters.RPC.Status
+            CPUUsage = $server.PerformanceCounters.CPU.AverageUsage
+            CPUStatus = $server.PerformanceCounters.CPU.Status
+            MemoryCommitted = $server.PerformanceCounters.Memory.CommittedBytesPercent
+            MemoryAvailableMB = $server.PerformanceCounters.Memory.AvailableMB
+            MemoryStatus = $server.PerformanceCounters.Memory.Status
+            DiskReadLatency = $server.PerformanceCounters.Disk.DatabaseReadLatency
+            DiskWriteLatency = $server.PerformanceCounters.Disk.DatabaseWriteLatency
+            LogWriteLatency = $server.PerformanceCounters.Disk.LogWriteLatency
+            DiskStatus = $server.PerformanceCounters.Disk.Status
         }
     }
 }
