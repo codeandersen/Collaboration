@@ -336,10 +336,18 @@ function Invoke-Section {
 
 function Resolve-DnsSafe {
     param([string]$Name, [string]$Type)
-    $params = @{ Name = $Name; Type = $Type; ErrorAction = "Stop" }
+    $params = @{ Name = $Name; Type = $Type; DnsOnly = $true; ErrorAction = "Stop" }
     if ($DnsServer) { $params.Server = $DnsServer }
-    try { return @(Resolve-DnsName @params) }
-    catch { return @() }
+    try {
+        return @(DnsClient\Resolve-DnsName @params | Where-Object { $_.Section -eq 'Answer' -and "$($_.Type)" -eq $Type })
+    }
+    catch {
+        # NXDOMAIN is an expected "no record" result; anything else is logged so empty DNS cells can be explained.
+        if ($_.Exception.Message -notmatch 'does not exist') {
+            Add-LogEntry -Section "DNS $Type $Name" -Reason $_.Exception.Message
+        }
+        return @()
+    }
 }
 
 function Get-TxtRecords {
@@ -694,7 +702,7 @@ function Get-DomainsSection {
         Add-Line
         $dnsRows = @()
         foreach ($d in $domains) {
-            $name = $d.DomainName
+            $name = "$($d.DomainName)".Trim()
             if ($name -like "*.onmicrosoft.com") { continue }
             $mx = @(Resolve-DnsSafe -Name $name -Type MX | ForEach-Object { $_.NameExchange }) -join '; '
             $spf = @(Get-TxtRecords -Name $name | Where-Object { $_ -like "v=spf1*" }) -join '; '
