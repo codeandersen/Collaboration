@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Generates a read-only Markdown review report of an Exchange Online tenant.
 
@@ -152,6 +152,24 @@ $script:CasMailboxes = $null
 $script:TenantName = $null
 $script:InitialDomain = $null
 $script:CollectedBy = $UserPrincipalName
+$script:SectionTitles = [ordered]@{
+    Summary          = 'Summary counts'
+    OrgConfig        = 'Organization configuration'
+    Recipients       = 'Recipients'
+    MailboxHygiene   = 'Mailbox hygiene'
+    Groups           = 'Groups'
+    Domains          = 'Domains and email authentication'
+    MailFlow         = 'Mail flow'
+    Hybrid           = 'Hybrid and migration'
+    Sharing          = 'Sharing'
+    ClientAccess     = 'Client access'
+    Permissions      = 'Permissions and RBAC'
+    ThreatProtection = 'Threat protection (EOP / Defender for Office 365)'
+    AlertPolicies    = 'Alert policies (Purview)'
+    Compliance       = 'Compliance and retention (EXO)'
+    Graph            = 'Microsoft Graph (opt-in)'
+    Appendix         = 'Appendix - collection log'
+}
 
 # ============================================================
 # Helpers
@@ -203,6 +221,14 @@ function Assert-Cmdlet {
     if (-not (Test-CmdletAvailable $Name)) {
         throw "cmdlet $Name not available (module not loaded or workload not licensed)"
     }
+}
+
+function ConvertTo-MdAnchor {
+    # GitHub slug rules: lowercase, strip anything that is not a letter, digit,
+    # space, hyphen or underscore, then replace each space with a hyphen.
+    param([string]$Title)
+    $slug = $Title.ToLower() -replace '[^a-z0-9 \-_]', ''
+    return ($slug -replace ' ', '-')
 }
 
 function Convert-ValueToText {
@@ -279,7 +305,7 @@ function Add-PurviewStatusOrThrow {
         Add-Line "_Skipped - Purview data not collected (run with -IncludePurview)_"
     }
     else {
-        Add-Line "_$state_"
+        Add-Line "_$($state)_"
         Add-LogEntry -Section $Section -Reason $state
     }
     return $true
@@ -301,7 +327,7 @@ function Invoke-Section {
     }
     catch {
         $reason = $_.Exception.Message
-        Add-Line "_Not available: $reason_"
+        Add-Line "_Not available: $($reason)_"
         Add-Line
         Add-LogEntry -Section $Title -Reason $reason
     }
@@ -320,6 +346,19 @@ function Get-TxtRecords {
     param([string]$Name)
     $records = Resolve-DnsSafe -Name $Name -Type TXT
     return @($records | ForEach-Object { ($_.Strings -join "") })
+}
+
+function Get-MessageDirection {
+    # Classifies a message against the tenant's accepted domains (lowercase list).
+    param([string]$Sender, [string]$Recipient, [string[]]$Domains)
+    $s = ("$Sender" -split '@')[-1].ToLower()
+    $r = ("$Recipient" -split '@')[-1].ToLower()
+    $sIn = $Domains -contains $s
+    $rIn = $Domains -contains $r
+    if ($sIn -and $rIn) { return 'Internal' }
+    if ($sIn) { return 'Outbound' }
+    if ($rIn) { return 'Inbound' }
+    return 'Other'
 }
 
 function Get-SharedMailboxes {
@@ -345,7 +384,7 @@ function Get-SharedCasMailboxes {
 # ============================================================
 
 function Get-OrgConfigSection {
-    Invoke-Section -Title "Organization configuration" -Body {
+    Invoke-Section -Title $script:SectionTitles.OrgConfig -Body {
         Assert-Cmdlet Get-OrganizationConfig
         $org = if ($script:OrgConfig) { $script:OrgConfig } else { Get-OrganizationConfig }
         Out-Table -CsvName "OrganizationConfig" -Columns @('Setting','Value') -Rows @(
@@ -400,10 +439,9 @@ function Get-OrgConfigSection {
 }
 
 function Get-RecipientsSection {
-    Invoke-Section -Title "Recipients" -Body {
+    Invoke-Section -Title $script:SectionTitles.Recipients -Body {
         Assert-Cmdlet Get-EXOMailbox
         $mbx = Get-SharedMailboxes
-        $typeOrder = @('UserMailbox','SharedMailbox','RoomMailbox','EquipmentMailbox','SchedulingMailbox','DiscoveryMailbox','PublicFolderMailbox','TeamMailbox')
         $rows = @($mbx | Group-Object RecipientTypeDetails | Sort-Object Name | ForEach-Object {
             [PSCustomObject]@{ RecipientType = $_.Name; Count = $_.Count }
         })
@@ -442,7 +480,7 @@ function Get-RecipientsSection {
 }
 
 function Get-MailboxHygieneSection {
-    Invoke-Section -Title "Mailbox hygiene" -Body {
+    Invoke-Section -Title $script:SectionTitles.MailboxHygiene -Body {
         $mbx = Get-SharedMailboxes
 
         Add-Line "### Holds and archiving"
@@ -570,7 +608,7 @@ function Get-MailboxHygieneSection {
 }
 
 function Get-GroupsSection {
-    Invoke-Section -Title "Groups" -Body {
+    Invoke-Section -Title $script:SectionTitles.Groups -Body {
         Assert-Cmdlet Get-DistributionGroup
         $dg = @(Get-DistributionGroup -ResultSize Unlimited)
         $dyn = @()
@@ -635,7 +673,7 @@ function Get-GroupsSection {
 }
 
 function Get-DomainsSection {
-    Invoke-Section -Title "Domains and email authentication" -Body {
+    Invoke-Section -Title $script:SectionTitles.Domains -Body {
         Assert-Cmdlet Get-AcceptedDomain
         $domains = if ($script:AcceptedDomains) { $script:AcceptedDomains } else { @(Get-AcceptedDomain) }
         $domRows = @($domains | ForEach-Object {
@@ -728,7 +766,7 @@ function Get-DomainsSection {
 }
 
 function Get-MailFlowSection {
-    Invoke-Section -Title "Mail flow" -Body {
+    Invoke-Section -Title $script:SectionTitles.MailFlow -Body {
         Add-Line "### Inbound connectors"
         Add-Line
         $inbound = @()
@@ -863,13 +901,28 @@ function Get-MailFlowSection {
             [PSCustomObject]@{ Status = $_.Name; Count = $_.Count }
         })
         Out-Table -CsvName "MessageTraceByStatus" -Rows $statusRows -Columns @('Status','Count')
+
+        Add-Line "#### Messages by direction"
+        Add-Line
+        $acceptedNames = @($script:AcceptedDomains | ForEach-Object { "$($_.DomainName)".ToLower() })
+        $dirCounts = [ordered]@{ Internal = 0; Outbound = 0; Inbound = 0; Other = 0 }
+        foreach ($msg in $trace) {
+            $dirCounts[(Get-MessageDirection -Sender $msg.SenderAddress -Recipient $msg.RecipientAddress -Domains $acceptedNames)]++
+        }
+        $dirRows = @($dirCounts.GetEnumerator() | ForEach-Object {
+            [PSCustomObject]@{ Direction = $_.Key; Count = $_.Value }
+        })
+        Out-Table -CsvName "MessageTraceByDirection" -Rows $dirRows -Columns @('Direction','Count')
+
         Register-Csv -Name 'MessageTrace' -Rows $trace
         $script:Summary['Message trace messages sampled'] = $trace.Count
+        $script:Summary['Messages sampled (inbound)'] = $dirCounts['Inbound']
+        $script:Summary['Messages sampled (outbound)'] = $dirCounts['Outbound']
     }
 }
 
 function Get-HybridSection {
-    Invoke-Section -Title "Hybrid and migration" -Body {
+    Invoke-Section -Title $script:SectionTitles.Hybrid -Body {
         $rows = @()
         try { $opo = @(Get-OnPremisesOrganization) } catch { $opo = @(); Add-LogEntry -Section 'OnPremisesOrganization' -Reason $_.Exception.Message }
         $rows += @($opo | ForEach-Object {
@@ -893,7 +946,7 @@ function Get-HybridSection {
 }
 
 function Get-SharingSection {
-    Invoke-Section -Title "Sharing" -Body {
+    Invoke-Section -Title $script:SectionTitles.Sharing -Body {
         Add-Line "### Organization relationships"
         Add-Line
         $rel = @()
@@ -935,7 +988,7 @@ function Get-SharingSection {
 }
 
 function Get-ClientAccessSection {
-    Invoke-Section -Title "Client access" -Body {
+    Invoke-Section -Title $script:SectionTitles.ClientAccess -Body {
         Add-Line "### OWA mailbox policies"
         Add-Line
         $owa = @()
@@ -1027,7 +1080,7 @@ function Get-ClientAccessSection {
 }
 
 function Get-PermissionsSection {
-    Invoke-Section -Title "Permissions and RBAC" -Body {
+    Invoke-Section -Title $script:SectionTitles.Permissions -Body {
         Add-Line "### Role groups and members"
         Add-Line
         $rg = @()
@@ -1101,7 +1154,21 @@ function Get-PermissionsSection {
         $sps = @()
         try { $sps = @(Get-ServicePrincipal) } catch { Add-LogEntry -Section 'ServicePrincipal' -Reason $_.Exception.Message }
         $spAssignments = @()
-        try { $spAssignments = @(Get-ManagementRoleAssignment -RoleAssigneeType ServicePrincipal) } catch { Add-LogEntry -Section 'SP role assignments' -Reason $_.Exception.Message }
+        try {
+            $spAssignments = @(Get-ManagementRoleAssignment -RoleAssigneeType ServicePrincipal -ErrorAction Stop)
+        }
+        catch {
+            # Older modules don't accept the ServicePrincipal assignee type; filter client-side instead.
+            try {
+                $spIds = @{}
+                foreach ($sp in $sps) { $spIds["$($sp.ObjectId)"] = $true; $spIds["$($sp.AppId)"] = $true }
+                $spAssignments = @(Get-ManagementRoleAssignment -ErrorAction Stop | Where-Object {
+                    $_.RoleAssigneeType -eq 'ServicePrincipal' -or $spIds.ContainsKey("$($_.App)") -or $spIds.ContainsKey("$($_.RoleAssignee)")
+                })
+                Add-LogEntry -Section 'SP role assignments' -Reason "-RoleAssigneeType ServicePrincipal unsupported; fell back to client-side filtering"
+            }
+            catch { Add-LogEntry -Section 'SP role assignments' -Reason $_.Exception.Message }
+        }
         $spById = @{}
         foreach ($sp in $sps) {
             $spById["$($sp.ObjectId)"] = $sp
@@ -1158,7 +1225,7 @@ function Get-PermissionsSection {
 }
 
 function Get-ThreatProtectionSection {
-    Invoke-Section -Title "Threat protection (EOP / Defender for Office 365)" -Body {
+    Invoke-Section -Title $script:SectionTitles.ThreatProtection -Body {
         $defenderAvailable = Test-CmdletAvailable Get-ATPProtectionPolicyRule
         if (-not $defenderAvailable) {
             Add-Line "_Defender for Office 365 not licensed / cmdlet not available - EOP data still collected below._"
@@ -1397,7 +1464,10 @@ function Get-ThreatProtectionSection {
         Add-Line "### Tenant Allow/Block List"
         Add-Line
         $tabl = @()
-        try { $tabl = @(Get-TenantAllowBlockListItems) } catch { Add-LogEntry -Section 'TenantAllowBlockListItems' -Reason $_.Exception.Message }
+        foreach ($listType in @('Sender','Url','FileHash','IP')) {
+            try { $tabl += @(Get-TenantAllowBlockListItems -ListType $listType -ErrorAction Stop) }
+            catch { Add-LogEntry -Section "TenantAllowBlockListItems ($listType)" -Reason $_.Exception.Message }
+        }
         $tablRows = @($tabl | ForEach-Object {
             [PSCustomObject]@{
                 ListType = $_.ListType
@@ -1495,7 +1565,7 @@ function Get-ThreatProtectionSection {
 }
 
 function Get-AlertPoliciesSection {
-    Invoke-Section -Title "Alert policies (Purview)" -Body {
+    Invoke-Section -Title $script:SectionTitles.AlertPolicies -Body {
         if (Add-PurviewStatusOrThrow -Section 'Alert policies') { return }
         Assert-Cmdlet Get-ProtectionAlert
         $alerts = @(Get-ProtectionAlert)
@@ -1516,7 +1586,7 @@ function Get-AlertPoliciesSection {
 }
 
 function Get-ComplianceSection {
-    Invoke-Section -Title "Compliance and retention (EXO)" -Body {
+    Invoke-Section -Title $script:SectionTitles.Compliance -Body {
         Add-Line "### MRM retention policies and tags"
         Add-Line
         $rp = @()
@@ -1663,7 +1733,7 @@ function Get-ComplianceSection {
 }
 
 function Get-GraphSection {
-    Invoke-Section -Title "Microsoft Graph (opt-in)" -Body {
+    Invoke-Section -Title $script:SectionTitles.Graph -Body {
         if (-not $IncludeGraph) {
             Add-Line "_Skipped - Graph data not collected (run with -IncludeGraph)_"
             return
@@ -1707,7 +1777,7 @@ function Get-GraphSection {
 }
 
 function Write-Appendix {
-    Add-Line "## Appendix - collection log"
+    Add-Line ("## " + $script:SectionTitles.Appendix)
     Add-Line
     if ($script:CollectionLog.Count -eq 0) {
         Add-Line "No skipped or failed sections."
@@ -1895,15 +1965,11 @@ try {
     Add-Line
     Add-Line "## Table of contents"
     Add-Line
-    $toc = @(
-        '1. Organization configuration', '2. Recipients', '3. Mailbox hygiene', '4. Groups',
-        '5. Domains and email authentication', '6. Mail flow', '7. Hybrid and migration',
-        '8. Sharing', '9. Client access', '10. Permissions and RBAC',
-        '11. Threat protection (EOP / Defender for Office 365)', '12. Alert policies (Purview)',
-        '13. Compliance and retention', '14. Appendix - collection log'
-    )
-    foreach ($t in $toc) { Add-Line "- $t" }
+    foreach ($title in $script:SectionTitles.Values) {
+        Add-Line "- [$title](#$(ConvertTo-MdAnchor $title))"
+    }
     Add-Line
+    $summaryInsertAt = $script:Report.Length
 
     Write-Host "`nCollecting report data..." -ForegroundColor Cyan
     Get-OrgConfigSection
@@ -1921,21 +1987,23 @@ try {
     Get-ComplianceSection
     Get-GraphSection
 
-    # Summary counts (inserted after TOC via second pass is complex; append at top of report body)
-    Add-Line "## Summary counts"
-    Add-Line
+    Write-Appendix
+
+    # Insert the summary counts block right after the TOC (header position)
+    $summaryBlock = [System.Text.StringBuilder]::new()
+    [void]$summaryBlock.AppendLine("## $($script:SectionTitles.Summary)")
+    [void]$summaryBlock.AppendLine()
     if ($script:Summary.Count -eq 0) {
-        Add-Line "_No counts collected._"
+        [void]$summaryBlock.AppendLine("_No counts collected._")
     }
     else {
         $sumRows = @($script:Summary.GetEnumerator() | ForEach-Object {
             [PSCustomObject]@{ Metric = $_.Key; Count = $_.Value }
         })
-        Add-Line (ConvertTo-MdTable -Rows $sumRows -Columns @('Metric','Count'))
+        [void]$summaryBlock.AppendLine((ConvertTo-MdTable -Rows $sumRows -Columns @('Metric','Count')))
     }
-    Add-Line
-
-    Write-Appendix
+    [void]$summaryBlock.AppendLine()
+    [void]$script:Report.Insert($summaryInsertAt, $summaryBlock.ToString())
 
     # Write report
     $script:Report.ToString() | Out-File -FilePath $reportPath -Encoding utf8

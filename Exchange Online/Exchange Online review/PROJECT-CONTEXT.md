@@ -4,9 +4,9 @@ This file holds everything needed to pick up the project again from another comp
 
 - **Owner:** Hans Christian Andersen (Cloud architect, Azure / Microsoft 365)
 - **Repo:** https://github.com/codeandersen/Collaboration (branch `main`)
-- **Folder:** `Exchange Online Review/`
-- **Last updated:** 2026-09-24
-- **Status:** PAUSED. The script is a complete first draft that has not been verified. The README hasn't been written yet.
+- **Folder:** `Exchange Online/Exchange Online review/` (moved here from the repo root `Exchange Online Review/` on 2026-09-25)
+- **Last updated:** 2026-09-25
+- **Status:** VERIFIED OFFLINE. Script is written, reviewed against PLAN.md, and passes all offline checks (parse in pwsh 7 and Windows PowerShell 5.1, ScriptAnalyzer with zero errors, 25/25 offline helper tests). README is done. What remains is a live tenant test by the user.
 
 ---
 
@@ -60,11 +60,11 @@ Build a **generic, reusable Exchange Online review** for any customer. It's a Po
 
 | File | Status | Notes |
 |---|---|---|
-| `Invoke-ExchangeOnlineReview.ps1` | Draft, ~1,960 lines, **not verified** | Collector and Markdown generator. |
+| `Invoke-ExchangeOnlineReview.ps1` | Done, ~1,980 lines, verified offline | Collector and Markdown generator. UTF-8 **with BOM** (required so Windows PowerShell 5.1 parses it correctly). |
 | `.gitignore` | Done | Ignores `Reports/`. |
 | `PLAN.md` | Done | Copy of the approved plan (full spec, section by section). |
 | `PROJECT-CONTEXT.md` | This file | Handoff and context. |
-| `README.md` | **TODO** | Contents are specified in section 6. |
+| `README.md` | Done | Purpose, prerequisites, permissions (EXO-only vs Purview), parameter table, examples, section/cmdlet list, troubleshooting, data-sensitivity note. |
 
 ## 4. Script architecture (current draft)
 
@@ -117,34 +117,38 @@ Style follows `Exchange Online/Get-TransportRules.ps1`: comment-based help, `[Cm
 
 ## 6. Remaining work (next steps, in order)
 
-1. **Write `README.md`.** Cover:
-   - Purpose
-   - Prerequisites: PowerShell 7 recommended, ExchangeOnlineManagement v3 latest, and optionally Microsoft.Graph
-   - Permissions, split into EXO-only and Purview (see above)
-   - A parameters table
-   - Examples: EXO only; `-IncludePurview -ExportCsv`; app-only certificate; full deep scan
-   - The section list with the cmdlets each section uses
-   - Troubleshooting
-   - A note on data sensitivity
-
-   Match the style of `Exchange Hybrid/README-EdgeBlocking-Assessment.md`.
-2. **Verify the script:**
-   - Parse check: `[System.Management.Automation.Language.Parser]::ParseFile(path, [ref]$null, [ref]$errors)` must return zero errors in pwsh 7 and in Windows PowerShell 5.1.
-   - `Invoke-ScriptAnalyzer` must report zero Error-severity findings. `PSAvoidUsingWriteHost` warnings are acceptable.
-   - Offline smoke test: extract the helper functions through the AST and test `ConvertTo-MdTable` (pipe and newline escaping, arrays, null/empty, truncation) and the Purview Skipped / Not available rendering, without connecting to anything.
-3. **Review the draft against `PLAN.md`** section by section. Check cmdlet and property names against the Microsoft Learn reference `https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/<cmdlet>?view=exchange-ps`, and fix any gaps. Specific things to double-check:
-   - The RBAC for Applications join (the assignment's `App` property compared with the SP `ObjectId`)
-   - The `Get-MessageTraceV2` parameters
-   - The TABL `-ListSubType AdvancedDelivery` usage
-   - The ARC cmdlet (`Get-ArcConfig`)
-   - The `Get-ExternalInOutlook` output shape
-4. **Live test by the user** on a test tenant:
+1. ~~**Write `README.md`.**~~ DONE.
+2. ~~**Verify the script.**~~ DONE — results below.
+3. ~~**Review the draft against `PLAN.md`.**~~ DONE — fixes listed below.
+4. **Live test by the user** on a test tenant (NOT YET DONE — only remaining step):
    - `.\Invoke-ExchangeOnlineReview.ps1 -CustomerName "Contoso"` (Purview sections should show Skipped)
    - `.\Invoke-ExchangeOnlineReview.ps1 -CustomerName "Contoso" -IncludePurview -ExportCsv`
 5. Fix any problems the live run turns up, then commit.
+
+### Verification results (2026-09-24)
+
+- Parse check: **0 errors** in pwsh 7.6.6 and Windows PowerShell 5.1.
+- `Invoke-ScriptAnalyzer -Severity Error,Warning`: **0 errors**, 36 warnings — all benign: `PSAvoidUsingWriteHost` (repo style), `PSAvoidUsingEmptyCatchBlock` (intentional best-effort collection), `PSUseSingularNouns` (helper names), `PSReviewUnusedParameter` for `-MaxRows`/`-DnsServer` (false positive — they're read inside helper functions), `PSUseDeclaredVarsMoreThanAssignments` fixed.
+- Offline smoke test (temporary script, AST extraction of the helper functions, no tenant; deleted after the run): **25/25 pass**. Covered: pipe/newline escaping, array join, empty → "_None found_", truncation note, Purview Skipped / Not available / collected paths, error section logging, TOC anchors, summary insertion after the TOC, message direction classification.
+- Read-only check: only `Get-*`, `Resolve-DnsName`, Connect/Disconnect, `Install-Module`, plus `New-Item` for output folders. No mutating Exchange cmdlets.
+
+### Fixes made during the PLAN.md review
+
+1. **Variable-expansion bug (critical):** `"_$state_"` and `"_Not available: $reason_"` interpolated `$state_`/`$reason_` (trailing underscore is a valid name char), rendering empty text. Changed to `"$($state)_"` / `"$($reason)_"`.
+2. **`Get-TenantAllowBlockListItems -ListType` is mandatory** (verified on Learn): now loops `Sender, Url, FileHash, IP` per call. `-ListSubType AdvancedDelivery` with `-ListType Url` confirmed for simulation URLs.
+3. **`-RoleAssigneeType ServicePrincipal` isn't a documented value** (Learn lists User/SecurityGroup/RoleAssignmentPolicy/ForeignSecurityPrincipal/RoleGroup/LinkedRoleGroup/Computer): kept the fast path but added a fallback that retrieves all assignments and filters on `RoleAssigneeType`/SP `ObjectId`/`AppId`/`RoleAssignee`, logging the fallback to the collection log.
+4. **Tenant name/initial domain in the header:** org config and accepted domains are now pre-collected before the header is written (they were previously `$null` because sections ran afterwards).
+5. **Mailbox size sorting:** `TotalItemSize` is a display string — the script now parses the "(… bytes)" value into `SizeBytes` and sorts numerically for the top-N table.
+6. **Output path:** `Resolve-Path` failure before `try` could throw; restructured to create the folder first.
+7. Minor: `$_` shadowing fixed in the role-assignment-policy mailbox count; OWA policy column renamed to `ClassicAttachmentsEnabled`; removed unused variable; `-AppId` now requires `-CertificateThumbprint` + `-Organization`.
+8. **Summary counts moved into the header:** recorded an insertion index right after the TOC and `StringBuilder.Insert` the "## Summary counts" block there after all sections run (was appended at the end of the report).
+9. **Clickable TOC:** hard-coded numbered list replaced with `- [Title](#anchor)` links generated from a single `$script:SectionTitles` ordered map that also supplies every level-2 heading and the appendix title (titles can't drift). New `ConvertTo-MdAnchor` implements GitHub slug rules (lowercase, strip non `[a-z0-9 \-_]`, spaces → `-`, no collapsing).
+10. **Message trace by direction:** new `Get-MessageDirection` classifies each traced message against the accepted domains (Internal / Outbound / Inbound / Other) in addition to the Status table; CSV `MessageTraceByDirection`; summary entries "Messages sampled (inbound)/(outbound)".
+
+Verified on Microsoft Learn: `Get-MessageTraceV2` (StartDate/EndDate, ResultSize ≤ 5000, 10-day window), `Get-EXOMailbox -InactiveMailboxOnly`/`-SoftDeletedMailbox`, `Get-TenantAllowBlockListItems`, `Get-ExoPhishSimOverrideRule`, `Get-ServicePrincipal`, `Get-ManagementRoleAssignment`, `Get-InboundConnector`. Other EF*/quarantine/report-submission properties are accessed defensively (missing properties render empty).
 
 ## 7. How to resume in a new AI session
 
 Tell the agent:
 
-> Continue the Exchange Online Review project. Read `Exchange Online Review/PROJECT-CONTEXT.md` and `Exchange Online Review/PLAN.md`, then start at "Remaining work" step 1.
+> Continue the Exchange Online Review project. Read `Exchange Online/Exchange Online review/PROJECT-CONTEXT.md` and `PLAN.md` in the same folder, then continue at the first open step under "Remaining work".
