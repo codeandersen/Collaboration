@@ -319,6 +319,7 @@ function Invoke-Section {
     )
     Add-Line (('#' * $Level) + " " + $Title)
     Add-Line
+    $PSDefaultParameterValues = @{ '*:ErrorAction' = 'Stop' }
     try {
         $result = & $Body
         if ($result) {
@@ -1884,7 +1885,9 @@ try {
         Write-Host "Connected to Exchange Online." -ForegroundColor Green
     }
     catch {
-        Write-Error "Failed to connect to Exchange Online: $_"
+        $messages = @(); $ex = $_.Exception
+        while ($ex) { $messages += $ex.Message; $ex = $ex.InnerException }
+        Write-Error "Failed to connect to Exchange Online: $(($messages | Select-Object -Unique) -join ' --> ')"
         exit 1
     }
 
@@ -1910,7 +1913,12 @@ try {
 
     if ($IncludePurview) {
         Write-Host "Connecting to Security & Compliance PowerShell (Purview)..." -ForegroundColor Cyan
-        $ippsParams = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+        $ippsParams = @{
+            ShowBanner  = $false
+            ErrorAction = 'Stop'
+            CommandName = @('Get-ProtectionAlert', 'Get-RetentionCompliancePolicy', 'Get-RetentionComplianceRule',
+                'Get-DlpCompliancePolicy', 'Get-DlpComplianceRule', 'Get-Label', 'Get-LabelPolicy', 'Get-ComplianceTag')
+        }
         if ($UserPrincipalName) { $ippsParams.UserPrincipalName = $UserPrincipalName }
         if ($AppId) {
             $ippsParams.AppId = $AppId
