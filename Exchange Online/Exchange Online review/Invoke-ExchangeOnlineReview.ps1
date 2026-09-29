@@ -66,6 +66,12 @@
 .PARAMETER DnsServer
     Optional DNS server for Resolve-DnsName lookups.
 
+.PARAMETER ExoLogPath
+    Optional folder for ExchangeOnlineManagement client logs. When set,
+    Connect-ExchangeOnline and Connect-IPPSSession run with
+    -EnableErrorReporting -LogDirectoryPath <path> -LogLevel All. Useful
+    when cmdlets fail with the generic 'server side error' message.
+
 .EXAMPLE
     .\Invoke-ExchangeOnlineReview.ps1 -CustomerName "Contoso"
     EXO-only review. Purview sections are marked as Skipped.
@@ -86,7 +92,7 @@
     Requires: ExchangeOnlineManagement module (v3)
     Optional:   Microsoft.Graph modules (-IncludeGraph)
     Install:    Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser
-    Version:    1.0
+    Version:    1.2
 #>
 
 [CmdletBinding()]
@@ -134,10 +140,13 @@ param(
     [int]$MaxRows = 50,
 
     [Parameter(Mandatory = $false)]
-    [string]$DnsServer
+    [string]$DnsServer,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ExoLogPath
 )
 
-$script:ScriptVersion = "1.0"
+$script:ScriptVersion = "1.2"
 $script:RunStart = Get-Date
 $script:CollectionLog = [System.Collections.Generic.List[object]]::new()
 $script:Summary = [ordered]@{}
@@ -179,16 +188,8 @@ function Initialize-ExchangeOnlineModule {
     Write-Host "Checking for ExchangeOnlineManagement module..." -ForegroundColor Cyan
     $module = Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1
     if (-not $module) {
-        Write-Host "ExchangeOnlineManagement module not found. Installing..." -ForegroundColor Yellow
-        try {
-            Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber
-            Write-Host "Module installed successfully." -ForegroundColor Green
-            $module = Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1
-        }
-        catch {
-            Write-Error "Failed to install ExchangeOnlineManagement module: $_"
-            exit 1
-        }
+        Write-Error "ExchangeOnlineManagement module not found. Install it first: Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser"
+        exit 1
     }
     else {
         Write-Host "ExchangeOnlineManagement module $($module.Version) found." -ForegroundColor Green
@@ -202,13 +203,72 @@ function Add-Line {
 }
 
 function Add-LogEntry {
-    param([string]$Section, [string]$Reason)
+    param([string]$Section, [string]$Reason, [System.Management.Automation.ErrorRecord]$ErrorRecord)
+    if ($ErrorRecord) { $Reason = Get-ErrorDetail $ErrorRecord }
     $script:CollectionLog.Add([PSCustomObject]@{
         Section = $Section
         Reason  = $Reason
         Time    = (Get-Date).ToString("HH:mm:ss")
     })
     Write-Host "  [$Section] $Reason" -ForegroundColor DarkYellow
+}
+
+function Get-ErrorDetail {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $messages = @(); $ex = $ErrorRecord.Exception
+    while ($ex) { $messages += $ex.Message; $ex = $ex.InnerException }
+    $text = ($messages | Select-Object -Unique) -join ' --> '
+    if ($ErrorRecord.FullyQualifiedErrorId) { $text += " [$($ErrorRecord.FullyQualifiedErrorId)]" }
+    return $text
+}
+
+function Invoke-ExoProxy {
+    $pass = @()
+    for ($i = 1; $i -lt $args.Count; $i++) {
+        if ($args[$i] -is [string] -and $args[$i] -match '^-ErrorAction:?$') { $i++; continue }
+        $pass += , $args[$i]
+    }
+    $PSDefaultParameterValues = @{}
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $sp = [Net.ServicePointManager]::SecurityProtocol
+        if (-not ($sp -band [Net.SecurityProtocolType]::Tls12)) { [Net.ServicePointManager]::SecurityProtocol = $sp -bor [Net.SecurityProtocolType]::Tls12 }
+        $ev = $null
+        $out = & $script:ExoProxyCommands[$args[0]] @pass -ErrorVariable ev 2>$null
+        $records = @($ev | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $_ }
+            elseif ($_ -is [System.Management.Automation.IContainsErrorRecord]) { $_.ErrorRecord }
+            elseif ($_ -is [Exception]) { [System.Management.Automation.ErrorRecord]::new($_, 'ExoProxyError', 'NotSpecified', $null) }
+        })
+        $tlsBroken = @($records | Where-Object { "$($_.Exception)" -match 'SslProtocolType' }).Count -gt 0
+        if (-not ($tlsBroken -and $attempt -eq 1)) { break }
+    }
+    $final = @($records | Where-Object {
+        $x = $_.Exception; $benign = $false
+        while ($x) {
+            if ($x -is [System.Net.WebException]) { $benign = ($x.Response -and [int]$x.Response.StatusCode -eq 403); break }
+            $x = $x.InnerException
+        }
+        -not $benign
+    })
+    if ($final.Count -gt 0) {
+        throw ((@($records) | ForEach-Object { Get-ErrorDetail $_ } | Select-Object -Unique) -join ' | ')
+    }
+    $out
+}
+
+function Register-ExoProxyWrapper {
+    $script:ExoProxyCommands = @{}
+    $names = @(Get-ConnectionInformation -ErrorAction SilentlyContinue | ForEach-Object { $_.ModuleName } | Where-Object { $_ })
+    $candidates = @($names) + @($names | ForEach-Object { Split-Path $_ -Leaf }) + @($names | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) })
+    $modules = @(Get-Module | Where-Object { $candidates -contains $_.Name -or $candidates -contains $_.Path -or $candidates -contains $_.ModuleBase -or $_.Name -like 'tmpEXO_*' } | Sort-Object Name -Unique)
+    foreach ($mod in $modules) {
+        foreach ($cmd in @(Get-Command -Module $mod.Name -CommandType Function)) {
+            $script:ExoProxyCommands[$cmd.Name] = "$($mod.Name)\$($cmd.Name)"
+            Set-Item -Path "function:script:$($cmd.Name)" -Value ([scriptblock]::Create("Invoke-ExoProxy '$($cmd.Name)' @args"))
+        }
+    }
+    if ($script:ExoProxyCommands.Count -eq 0) { Write-Warning "No Exchange Online proxy cmdlets found to wrap; cmdlets may fail with -ErrorAction Stop." }
+    else { Write-Host "Prepared $($script:ExoProxyCommands.Count) Exchange Online / Purview cmdlets." -ForegroundColor DarkGray }
 }
 
 function Test-CmdletAvailable {
@@ -220,6 +280,213 @@ function Assert-Cmdlet {
     param([string]$Name)
     if (-not (Test-CmdletAvailable $Name)) {
         throw "cmdlet $Name not available (module not loaded or workload not licensed)"
+    }
+}
+
+function Resolve-DirectoryObjectLabel {
+    param([string]$Id)
+    if ($null -eq $script:DirObjCache) { $script:DirObjCache = @{} }
+    if ($script:DirObjCache.ContainsKey($Id)) { return $script:DirObjCache[$Id] }
+    if ($null -eq $script:SpCache) { $script:SpCache = @(); try { $script:SpCache = @(Get-ServicePrincipal) } catch { } }
+    $label = $null
+    $sp = @($script:SpCache | Where-Object { "$($_.ObjectId)" -eq $Id -or "$($_.AppId)" -eq $Id -or "$($_.Identity)" -eq $Id }) | Select-Object -First 1
+    if ($sp) { $label = "$($sp.DisplayName) (app)" }
+    if (-not $label) { try { $u = Get-User -Identity $Id -ErrorAction Stop; if ($u) { $label = "$($u.DisplayName)" } } catch { } }
+    if (-not $label) { try { $g = Get-Group -Identity $Id -ErrorAction Stop; if ($g) { $label = "$($g.DisplayName) (group)" } } catch { } }
+    $namePart = "$($label -replace ' \((app|group)\)$', '')".Trim()
+    if (-not $label -or $namePart -notmatch '\S' -or $namePart -match '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') { $label = "Unresolved Entra object $Id" }
+    $script:DirObjCache[$Id] = $label
+    return $label
+}
+
+function Get-RoleGroupDisplayName {
+    param([string]$Name)
+    $map = [ordered]@{ '^TenantAdmins_' = 'Global Administrator'; '^ExchangeServiceAdmins_' = 'Exchange Administrator'; '^ComplianceAdmins_' = 'Compliance Administrator'; '^SecurityAdmins_' = 'Security Administrator'; '^GlobalReaders_' = 'Global Reader' }
+    foreach ($k in $map.Keys) { if ($Name -match $k) { return "$Name (Entra role: $($map[$k]))" } }
+    if ($Name -match '^[A-Za-z]+_-?\d{6,}$') { return "$Name (linked to an Entra role)" }
+    return $Name
+}
+
+function ConvertTo-CsvRow {
+    param([object[]]$Rows)
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row) { continue }
+        $o = [ordered]@{}
+        foreach ($p in $row.PSObject.Properties) {
+            $v = $p.Value
+            if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) {
+                $v = (@($v | ForEach-Object { if ($null -ne $_.Name -and $_ -isnot [string]) { "$($_.Name)" } else { "$_" } }) -join '; ')
+            }
+            $o[$p.Name] = $v
+        }
+        [PSCustomObject]$o
+    }
+}
+function Test-IsTrue {
+    param($Value)
+    if ($Value -is [bool]) { return $Value }
+    return ("$Value" -eq 'True')
+}
+
+function Format-RetentionPeriod {
+    param($Tag)
+    if (-not (Test-IsTrue $Tag.RetentionEnabled) -or $null -eq $Tag.AgeLimitForRetention -or "$($Tag.AgeLimitForRetention)" -eq '') { return 'Unlimited' }
+    [timespan]$ts = [timespan]::Zero
+    if ($Tag.AgeLimitForRetention -is [timespan]) { $ts = $Tag.AgeLimitForRetention }
+    elseif (-not [timespan]::TryParse("$($Tag.AgeLimitForRetention)", [ref]$ts)) { return "$($Tag.AgeLimitForRetention)" }
+    $d = [int]$ts.TotalDays
+    if ($d -gt 0 -and $d % 365 -eq 0) { return "$d days ($($d / 365) year(s))" }
+    return "$d days"
+}
+function Format-RetentionRule {
+    param($Rule, [hashtable]$TagNames)
+    $label = "$(@($Rule.PublishComplianceTag, $Rule.ApplyComplianceTag) | Where-Object { $_ } | Select-Object -First 1)"
+    $label = ($label -split ',')[0].Trim()
+    if ($TagNames -and $TagNames.ContainsKey($label)) { $label = $TagNames[$label] }
+    if ($Rule.PublishComplianceTag) { return "Publishes retention label: $label" }
+    if ($Rule.ApplyComplianceTag) { return "Auto-applies retention label: $label" }
+    $dur = "$($Rule.RetentionDuration)"
+    $d = 0
+    $durText = if ($dur -eq '' -or $dur -eq 'Unlimited') { 'forever' }
+               elseif ([int]::TryParse($dur, [ref]$d)) { if ($d -gt 0 -and $d % 365 -eq 0) { "$d days ($($d / 365) year(s))" } else { "$d days" } }
+               else { $dur }
+    $basis = switch ("$($Rule.ExpirationDateOption)") {
+        'CreationAgeInDays'     { ' (based on when items were created)' }
+        'ModificationAgeInDays' { ' (based on when items were last modified)' }
+        default                 { '' }
+    }
+    switch ("$($Rule.RetentionComplianceAction)") {
+        'Keep'          { return $(if ($durText -eq 'forever') { "Retain items forever$basis" } else { "Retain items for $durText$basis" }) }
+        'Delete'        { return "Delete items older than $durText$basis" }
+        'KeepAndDelete' { return "Retain items for $durText, then delete them$basis" }
+        default         { return "$($Rule.Name)" }
+    }
+}
+function Get-SensitivityLabelInfo {
+    param($Label, [object[]]$AllLabels)
+    $types = @(@($Label.LabelActions) | ForEach-Object { if ("$_" -match '"Type"\s*:\s*"([^"]+)"') { $Matches[1].ToLower() } })
+    $scopeMap = @{ 'File' = 'Files & other data assets'; 'Email' = 'Email'; 'Site' = 'Site'; 'UnifiedGroup' = 'UnifiedGroup'; 'Teamwork' = 'Meetings'; 'SchematizedData' = 'Schematized data assets' }
+    $scope = @("$($Label.ContentType)" -split '\s*,\s*' | Where-Object { $_ } | ForEach-Object { if ($scopeMap.ContainsKey($_)) { $scopeMap[$_] } else { $_ } }) -join ', '
+    $findLabel = { param($id) @($AllLabels | Where-Object { "$id" -ne '' -and ("$($_.Guid)" -eq "$id" -or "$($_.ImmutableId)" -eq "$id" -or "$($_.Name)" -eq "$id" -or "$($_.Identity)" -eq "$id") }) | Select-Object -First 1 }
+    $parent = $null
+    if ("$($Label.ParentId)" -match '\S') { $p = & $findLabel $Label.ParentId; $parent = if ($p) { "$($p.DisplayName)" } else { "$($Label.ParentId)" } }
+    $sub = @($AllLabels | Where-Object { "$($_.ParentId)" -match '\S' -and ((& $findLabel $_.ParentId) -eq $Label) } | Sort-Object Priority | ForEach-Object { "$($_.DisplayName)" })
+    $marking = @()
+    if ($types -contains 'applycontentmarking' -or $types -contains 'applycontentmarkingheader' -or $Label.ApplyContentMarkingHeaderEnabled) { $marking += 'Header' }
+    if ($types -contains 'applycontentmarkingfooter' -or $Label.ApplyContentMarkingFooterEnabled) { $marking += 'Footer' }
+    if ($types -contains 'applywatermarking' -or $Label.ApplyWaterMarkingEnabled) { $marking += 'Watermark' }
+    $encrypt = ($types -contains 'encrypt') -or $Label.EncryptionEnabled
+    $groupSite = [bool]$Label.SiteAndGroupProtectionEnabled
+    [PSCustomObject]@{
+        Scope          = $scope
+        Parent         = $parent
+        Sublabels      = $sub
+        AccessControl  = $(if ($encrypt) { 'Access control (encryption)' } else { 'None' })
+        ContentMarking = $(if ($marking.Count) { $marking -join ', ' } else { 'None' })
+        AutoLabeling   = $(if ("$($Label.Conditions)" -match '\S') { 'Configured' } else { 'None' })
+        GroupSettings  = $(if (($types -contains 'protectgroup') -or ($groupSite -and $scope -match 'UnifiedGroup')) { 'Configured' } else { 'None' })
+        SiteSettings   = $(if (($types -contains 'protectsite') -or ($groupSite -and $scope -match 'Site')) { 'Configured' } else { 'None' })
+        ActionTypes    = ($types | Select-Object -Unique) -join ', '
+    }
+}
+
+function Resolve-LabelNames {
+    param([object[]]$Ids, [object[]]$AllLabels)
+    @($Ids | Where-Object { $_ } | ForEach-Object {
+        $id = "$_"
+        $l = @($AllLabels | Where-Object { "$($_.Guid)" -eq $id -or "$($_.ImmutableId)" -eq $id -or "$($_.Name)" -eq $id -or "$($_.Identity)" -eq $id }) | Select-Object -First 1
+        if ($l) { "$($l.DisplayName)" } else { $id }
+    })
+}
+function Get-RoleGroupMemberInfo {
+    param([object[]]$Members)
+    $groups = @(); $users = @()
+    $guid = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    foreach ($m in @($Members | Where-Object { $_ })) {
+        $label = @("$($m.DisplayName)", "$($m.PrimarySmtpAddress)", "$($m.Name)") | Where-Object { $_ -and $_ -notmatch $guid } | Select-Object -First 1
+        if (-not $label) { $label = Resolve-DirectoryObjectLabel -Id "$(@($m.ExternalDirectoryObjectId, $m.Name, $m.Identity) | Where-Object { "$_" -match $guid } | Select-Object -First 1)" }
+        if ("$($m.RecipientType) $($m.RecipientTypeDetails)" -match 'Group' -or $label -like '* (group)') { $groups += $label } else { $users += $label }
+    }
+    $parts = @()
+    if ($groups.Count) { $parts += "$($groups.Count) group(s): " + (@($groups | Select-Object -First 3) -join ', ') + $(if ($groups.Count -gt 3) { ' …' } else { '' }) }
+    if ($users.Count) { $parts += "$($users.Count) user(s)/app(s)" }
+    [PSCustomObject]@{
+        Summary = $(if ($parts.Count) { $parts -join '; ' } else { 'No members' })
+        Groups  = $groups
+        Users   = $users
+    }
+}
+function Get-QuarantinePermissionInfo {
+    param($Policy)
+    $map = [ordered]@{
+        'PermissionToRelease'        = @{ Bit = 4;  Label = 'Release the message from quarantine' }
+        'PermissionToRequestRelease' = @{ Bit = 8;  Label = 'Request release of the message' }
+        'PermissionToDelete'         = @{ Bit = 1;  Label = 'Delete the message' }
+        'PermissionToPreview'        = @{ Bit = 2;  Label = 'Preview the message' }
+        'PermissionToAllowSender'    = @{ Bit = 32; Label = 'Allow sender' }
+        'PermissionToBlockSender'    = @{ Bit = 16; Label = 'Block sender' }
+    }
+    $v = 0
+    $text = "$($Policy.EndUserQuarantinePermissions)"
+    if ($text -match 'PermissionTo\w+\s*:') {
+        foreach ($k in $map.Keys) { if ($text -match "$k\s*:\s*True") { $v = $v -bor $map[$k].Bit } }
+    }
+    else { [void][int]::TryParse("$($Policy.EndUserQuarantinePermissionsValue)", [ref]$v) }
+    $granted = @($map.Keys | Where-Object { $v -band $map[$_].Bit } | ForEach-Object { $map[$_].Label })
+    $access = switch ($v -band 63) {
+        0       { 'No access' }
+        43      { 'Limited access' }
+        39      { 'Full access' }
+        default { 'Specific access (custom)' }
+    }
+    [PSCustomObject]@{
+        Access        = $access
+        Permissions   = $(if ($granted.Count) { $granted -join '; ' } else { 'None (view message header only)' })
+        Notifications = $(if (Test-IsTrue $Policy.ESNEnabled) { 'Enabled' } else { 'Disabled' })
+    }
+}
+function Get-PolicyRuleInfo {
+    param($Policy, $Rule, [object[]]$PresetRules, [object[]]$BuiltInRules, [switch]$SenderBased, [switch]$RuleLookupFailed)
+    $f = if ($SenderBased) { @('From','FromMemberOf','SenderDomainIs','ExceptIfFrom','ExceptIfFromMemberOf','ExceptIfSenderDomainIs') }
+         else { @('SentTo','SentToMemberOf','RecipientDomainIs','ExceptIfSentTo','ExceptIfSentToMemberOf','ExceptIfRecipientDomainIs') }
+    $refProps = 'HostedContentFilterPolicy','AntiPhishPolicy','MalwareFilterPolicy','SafeAttachmentPolicy','SafeLinksPolicy'
+    $matchRule = { param($rules) @($rules | Where-Object { $r = $_; @($refProps | Where-Object { "$($r.$_)" -eq "$($Policy.Name)" }).Count -gt 0 }) | Select-Object -First 1 }
+    $kind = 'Custom'; $scopeRule = $Rule
+    if ("$($Policy.Name)" -eq 'Evaluation Policy') {
+        $kind = 'Evaluation'
+    }
+    elseif ("$($Policy.RecommendedPolicyType)" -in 'Standard','Strict') {
+        $kind = "$($Policy.RecommendedPolicyType) preset"; $scopeRule = & $matchRule $PresetRules
+    }
+    elseif ((Test-IsTrue $Policy.IsBuiltInProtection) -or "$($Policy.Name)" -like 'Built-In Protection Policy*') {
+        $kind = 'Built-in protection'; $scopeRule = & $matchRule $BuiltInRules
+    }
+    elseif ((Test-IsTrue $Policy.IsDefault) -or "$($Policy.Name)" -eq 'Default') { $kind = 'Default' }
+    $status = switch ($kind) {
+        'Default'             { 'On (default policy)' }
+        'Built-in protection' { 'On (built-in protection)' }
+        'Evaluation'          { 'Not in use (evaluation policy)' }
+        default { if ($scopeRule) { "$($scopeRule.State)" } elseif ($RuleLookupFailed -and -not $scopeRule) { 'Unknown (rule lookup failed)' } else { 'Not applied (no rule)' } }
+    }
+    $inc = @(@($scopeRule.($f[0])) + @($scopeRule.($f[1])) + @($scopeRule.($f[2])) | Where-Object { $_ })
+    $exc = @(@($scopeRule.($f[3])) + @($scopeRule.($f[4])) + @($scopeRule.($f[5])) | Where-Object { $_ })
+    $applies = if ($kind -eq 'Evaluation') { 'Not applicable' }
+        elseif ($kind -in 'Default','Built-in protection' -and $inc.Count -eq 0) { 'All recipients' }
+        elseif ($kind -in 'Standard preset','Strict preset' -and $scopeRule -and $inc.Count -eq 0) { 'All recipients' }
+        elseif ($RuleLookupFailed -and -not $scopeRule) { 'Unknown (rule lookup failed)' }
+        elseif ($inc.Count -eq 0) { 'Nobody (no conditions)' }
+        else {
+            $parts = @()
+            $u = @($scopeRule.($f[0]) | Where-Object { $_ }).Count; if ($u) { $parts += "$u user(s)" }
+            $g = @($scopeRule.($f[1]) | Where-Object { $_ }).Count; if ($g) { $parts += "$g group(s)" }
+            $d = @($scopeRule.($f[2]) | Where-Object { $_ }); if ($d.Count) { $parts += "Domains: " + ((@($d | Select-Object -First 3)) -join ', ') + $(if ($d.Count -gt 3) { " (+$($d.Count - 3))" } else { '' }) }
+            $parts -join '; '
+        }
+    if ($exc.Count -gt 0) { $applies += ' (with exclusions)' }
+    [PSCustomObject]@{
+        Kind = $kind; Status = $status; Priority = $(if ($kind -in 'Default','Built-in protection') { 'Lowest' } elseif ($kind -eq 'Evaluation') { $null } elseif ($scopeRule) { $scopeRule.Priority } else { $null }); AppliesTo = $applies
+        IncludedUsers = $scopeRule.($f[0]); IncludedGroups = $scopeRule.($f[1]); IncludedDomains = $scopeRule.($f[2])
+        ExcludedUsers = $scopeRule.($f[3]); ExcludedGroups = $scopeRule.($f[4]); ExcludedDomains = $scopeRule.($f[5])
     }
 }
 
@@ -327,7 +594,7 @@ function Invoke-Section {
         }
     }
     catch {
-        $reason = $_.Exception.Message
+        $reason = Get-ErrorDetail $_
         Add-Line "_Not available: $($reason)_"
         Add-Line
         Add-LogEntry -Section $Title -Reason $reason
@@ -337,18 +604,25 @@ function Invoke-Section {
 
 function Resolve-DnsSafe {
     param([string]$Name, [string]$Type)
-    $params = @{ Name = $Name; Type = $Type; DnsOnly = $true; ErrorAction = "Stop" }
-    if ($DnsServer) { $params.Server = $DnsServer }
-    try {
-        return @(DnsClient\Resolve-DnsName @params | Where-Object { $_.Section -eq 'Answer' -and "$($_.Type)" -eq $Type })
-    }
-    catch {
-        # NXDOMAIN is an expected "no record" result; anything else is logged so empty DNS cells can be explained.
-        if ($_.Exception.Message -notmatch 'does not exist') {
-            Add-LogEntry -Section "DNS $Type $Name" -Reason $_.Exception.Message
+    if ($null -eq $script:DnsBadServers) { $script:DnsBadServers = @{} }
+    $servers = if ($DnsServer) { @($DnsServer) } else { @('1.1.1.1', '8.8.8.8', '') }
+    $lastError = $null
+    foreach ($server in $servers) {
+        if ($server -and $script:DnsBadServers.ContainsKey($server)) { continue }
+        $params = @{ Name = $Name; Type = $Type; DnsOnly = $true; QuickTimeout = $true; ErrorAction = "Stop" }
+        if ($server) { $params.Server = $server }
+        try {
+            return @(DnsClient\Resolve-DnsName @params | Where-Object { $_.Section -eq 'Answer' -and "$($_.Type)" -eq $Type })
         }
-        return @()
+        catch {
+            # NXDOMAIN is an expected "no record" result; anything else is logged so empty DNS cells can be explained.
+            if ($_.Exception.Message -match 'does not exist') { return @() }
+            $lastError = $_
+            if ($server -and -not $DnsServer) { $script:DnsBadServers[$server] = $true }
+        }
     }
+    if ($lastError) { Add-LogEntry -Section "DNS $Type $Name" -ErrorRecord $lastError }
+    return @()
 }
 
 function Get-TxtRecords {
@@ -359,9 +633,9 @@ function Get-TxtRecords {
 
 function Get-MessageDirection {
     # Classifies a message against the tenant's accepted domains (lowercase list).
-    param([string]$Sender, [string]$Recipient, [string[]]$Domains)
-    $s = ("$Sender" -split '@')[-1].ToLower()
-    $r = ("$Recipient" -split '@')[-1].ToLower()
+    param([string]$SenderAddress, [string]$RecipientAddress, [string[]]$Domains)
+    $s = ("$SenderAddress" -split '@')[-1].ToLower()
+    $r = ("$RecipientAddress" -split '@')[-1].ToLower()
     $sIn = $Domains -contains $s
     $rIn = $Domains -contains $r
     if ($sIn -and $rIn) { return 'Internal' }
@@ -383,7 +657,9 @@ function Get-SharedMailboxes {
 
 function Get-SharedCasMailboxes {
     if ($null -eq $script:CasMailboxes) {
-        $script:CasMailboxes = @(Get-EXOCASMailbox -ResultSize Unlimited)
+        $props = @('PopEnabled', 'ImapEnabled', 'EwsEnabled', 'ActiveSyncEnabled', 'MAPIEnabled', 'OWAEnabled',
+                   'SmtpClientAuthenticationDisabled', 'OwaMailboxPolicy', 'ActiveSyncMailboxPolicy')
+        $script:CasMailboxes = @(Get-EXOCASMailbox -ResultSize Unlimited -Properties $props)
     }
     return $script:CasMailboxes
 }
@@ -477,8 +753,8 @@ function Get-RecipientsSection {
         Add-Line
         $inactive = @()
         $softDeleted = @()
-        try { $inactive = @(Get-EXOMailbox -InactiveMailboxOnly -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Inactive mailboxes' -Reason $_.Exception.Message }
-        try { $softDeleted = @(Get-EXOMailbox -SoftDeletedMailbox -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Soft-deleted mailboxes' -Reason $_.Exception.Message }
+        try { $inactive = @(Get-EXOMailbox -InactiveMailboxOnly -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Inactive mailboxes' -ErrorRecord $_ }
+        try { $softDeleted = @(Get-EXOMailbox -SoftDeletedMailbox -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Soft-deleted mailboxes' -ErrorRecord $_ }
         Out-Table -CsvName "InactiveMailboxes" -Columns @('Type','Count') -Rows @(
             [PSCustomObject]@{ Type = 'Inactive mailboxes'; Count = $inactive.Count }
             [PSCustomObject]@{ Type = 'Soft-deleted mailboxes'; Count = $softDeleted.Count }
@@ -495,24 +771,24 @@ function Get-MailboxHygieneSection {
         Add-Line "### Holds and archiving"
         Add-Line
         Out-Table -CsvName "MailboxHoldCounts" -Columns @('State','Count') -Rows @(
-            [PSCustomObject]@{ State = 'Litigation hold enabled'; Count = @($mbx | Where-Object { $_.LitigationHoldEnabled }).Count }
+            [PSCustomObject]@{ State = 'Litigation hold enabled'; Count = @($mbx | Where-Object { Test-IsTrue $_.LitigationHoldEnabled }).Count }
             [PSCustomObject]@{ State = 'Archive enabled'; Count = @($mbx | Where-Object { $_.ArchiveStatus -eq 'Active' }).Count }
-            [PSCustomObject]@{ State = 'Auto-expanding archive'; Count = @($mbx | Where-Object { $_.AutoExpandingArchiveEnabled }).Count }
-            [PSCustomObject]@{ State = 'Retention hold enabled'; Count = @($mbx | Where-Object { $_.RetentionHoldEnabled }).Count }
+            [PSCustomObject]@{ State = 'Auto-expanding archive'; Count = @($mbx | Where-Object { Test-IsTrue $_.AutoExpandingArchiveEnabled }).Count }
+            [PSCustomObject]@{ State = 'Retention hold enabled'; Count = @($mbx | Where-Object { Test-IsTrue $_.RetentionHoldEnabled }).Count }
         )
 
         Add-Line "### Mailbox auditing"
         Add-Line
         Out-Table -CsvName "MailboxAuditCounts" -Columns @('State','Count') -Rows @(
-            [PSCustomObject]@{ State = 'Audit enabled'; Count = @($mbx | Where-Object { $_.AuditEnabled }).Count }
-            [PSCustomObject]@{ State = 'Audit disabled'; Count = @($mbx | Where-Object { -not $_.AuditEnabled }).Count }
+            [PSCustomObject]@{ State = 'Audit enabled'; Count = @($mbx | Where-Object { Test-IsTrue $_.AuditEnabled }).Count }
+            [PSCustomObject]@{ State = 'Audit disabled'; Count = @($mbx | Where-Object { -not (Test-IsTrue $_.AuditEnabled) }).Count }
         )
         $bypass = @()
         try {
             Assert-Cmdlet Get-MailboxAuditBypassAssociation
-            $bypass = @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited | Where-Object { $_.AuditBypassEnabled })
+            $bypass = @(Get-MailboxAuditBypassAssociation -ResultSize Unlimited | Where-Object { Test-IsTrue $_.AuditBypassEnabled })
         }
-        catch { Add-LogEntry -Section 'Mailbox audit bypass' -Reason $_.Exception.Message }
+        catch { Add-LogEntry -Section 'Mailbox audit bypass' -ErrorRecord $_ }
         $bypassRows = @($bypass | ForEach-Object {
             [PSCustomObject]@{ Identity = $_.Name; AuditBypassEnabled = $_.AuditBypassEnabled }
         })
@@ -537,8 +813,8 @@ function Get-MailboxHygieneSection {
         Add-Line
         $users = @()
         try { $users = @(Get-User -ResultSize Unlimited -RecipientTypeDetails SharedMailbox,RoomMailbox,EquipmentMailbox) }
-        catch { Add-LogEntry -Section 'Shared/room sign-in state' -Reason $_.Exception.Message }
-        $enabledRows = @($users | Where-Object { -not $_.AccountDisabled } | ForEach-Object {
+        catch { Add-LogEntry -Section 'Shared/room sign-in state' -ErrorRecord $_ }
+        $enabledRows = @($users | Where-Object { -not (Test-IsTrue $_.AccountDisabled) } | ForEach-Object {
             [PSCustomObject]@{ UserPrincipalName = $_.UserPrincipalName; RecipientTypeDetails = $_.RecipientTypeDetails; AccountDisabled = $_.AccountDisabled }
         })
         Out-Table -CsvName "SharedMailboxesSignInEnabled" -Rows $enabledRows -Columns @('UserPrincipalName','RecipientTypeDetails','AccountDisabled')
@@ -621,9 +897,9 @@ function Get-GroupsSection {
         Assert-Cmdlet Get-DistributionGroup
         $dg = @(Get-DistributionGroup -ResultSize Unlimited)
         $dyn = @()
-        try { $dyn = @(Get-DynamicDistributionGroup -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Dynamic distribution groups' -Reason $_.Exception.Message }
+        try { $dyn = @(Get-DynamicDistributionGroup -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Dynamic distribution groups' -ErrorRecord $_ }
         $m365 = @()
-        try { $m365 = @(Get-UnifiedGroup -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Microsoft 365 groups' -Reason $_.Exception.Message }
+        try { $m365 = @(Get-UnifiedGroup -ResultSize Unlimited) } catch { Add-LogEntry -Section 'Microsoft 365 groups' -ErrorRecord $_ }
 
         Add-Line "### Summary"
         Add-Line
@@ -655,7 +931,7 @@ function Get-GroupsSection {
                 HiddenFromExchangeClientsEnabled = $_.HiddenFromExchangeClientsEnabled
                 HiddenFromAddressListsEnabled = $_.HiddenFromAddressListsEnabled
                 RequireSenderAuthenticationEnabled = $_.RequireSenderAuthenticationEnabled
-                AllowExternalSenders = (-not $_.RequireSenderAuthenticationEnabled)
+                AllowExternalSenders = (-not (Test-IsTrue $_.RequireSenderAuthenticationEnabled))
                 ManagedBy = $_.ManagedBy
             }
         })
@@ -674,7 +950,7 @@ function Get-GroupsSection {
 
         Add-Line "### Groups accepting external senders"
         Add-Line
-        $extRows = @($dg | Where-Object { -not $_.RequireSenderAuthenticationEnabled } | ForEach-Object {
+        $extRows = @($dg | Where-Object { -not (Test-IsTrue $_.RequireSenderAuthenticationEnabled) } | ForEach-Object {
             [PSCustomObject]@{ Name = $_.Name; RecipientTypeDetails = $_.RecipientTypeDetails; PrimarySmtpAddress = $_.PrimarySmtpAddress; RequireSenderAuthenticationEnabled = $_.RequireSenderAuthenticationEnabled }
         })
         Out-Table -CsvName "GroupsAcceptExternal" -Rows $extRows -Columns @('Name','RecipientTypeDetails','PrimarySmtpAddress','RequireSenderAuthenticationEnabled')
@@ -697,7 +973,7 @@ function Get-DomainsSection {
         $script:Summary['Accepted domains'] = $domains.Count
 
         $dkim = @()
-        try { $dkim = @(Get-DkimSigningConfig) } catch { Add-LogEntry -Section 'DKIM config' -Reason $_.Exception.Message }
+        try { $dkim = @(Get-DkimSigningConfig) } catch { Add-LogEntry -Section 'DKIM config' -ErrorRecord $_ }
 
         Add-Line "### DNS records per domain"
         Add-Line
@@ -766,7 +1042,7 @@ function Get-DomainsSection {
         Add-Line "### ARC trusted sealers"
         Add-Line
         $arc = @()
-        try { $arc = @(Get-ArcConfig) } catch { Add-LogEntry -Section 'ARC config' -Reason $_.Exception.Message }
+        try { $arc = @(Get-ArcConfig) } catch { Add-LogEntry -Section 'ARC config' -ErrorRecord $_ }
         $arcRows = @($arc | ForEach-Object {
             [PSCustomObject]@{ Identity = $_.Identity; ArcTrustedSealers = $_.ArcTrustedSealers }
         })
@@ -779,7 +1055,7 @@ function Get-MailFlowSection {
         Add-Line "### Inbound connectors"
         Add-Line
         $inbound = @()
-        try { $inbound = @(Get-InboundConnector) } catch { Add-LogEntry -Section 'Inbound connectors' -Reason $_.Exception.Message }
+        try { $inbound = @(Get-InboundConnector) } catch { Add-LogEntry -Section 'Inbound connectors' -ErrorRecord $_ }
         $inRows = @($inbound | ForEach-Object {
             $efOn = ($_.EFSkipLastIP -eq $true) -or (@($_.EFSkipIPs).Count -gt 0)
             [PSCustomObject]@{
@@ -807,7 +1083,7 @@ function Get-MailFlowSection {
         Add-Line "### Outbound connectors"
         Add-Line
         $outbound = @()
-        try { $outbound = @(Get-OutboundConnector) } catch { Add-LogEntry -Section 'Outbound connectors' -Reason $_.Exception.Message }
+        try { $outbound = @(Get-OutboundConnector) } catch { Add-LogEntry -Section 'Outbound connectors' -ErrorRecord $_ }
         $outRows = @($outbound | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -829,7 +1105,7 @@ function Get-MailFlowSection {
         Add-Line "### Transport rules"
         Add-Line
         $rules = @()
-        try { $rules = @(Get-TransportRule) } catch { Add-LogEntry -Section 'Transport rules' -Reason $_.Exception.Message }
+        try { $rules = @(Get-TransportRule) } catch { Add-LogEntry -Section 'Transport rules' -ErrorRecord $_ }
         $ruleRows = @($rules | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -848,7 +1124,7 @@ function Get-MailFlowSection {
         Add-Line "### Remote domains"
         Add-Line
         $remote = @()
-        try { $remote = @(Get-RemoteDomain) } catch { Add-LogEntry -Section 'Remote domains' -Reason $_.Exception.Message }
+        try { $remote = @(Get-RemoteDomain) } catch { Add-LogEntry -Section 'Remote domains' -ErrorRecord $_ }
         $remoteRows = @($remote | ForEach-Object {
             [PSCustomObject]@{
                 DomainName = $_.DomainName
@@ -864,7 +1140,7 @@ function Get-MailFlowSection {
         Add-Line "### Journal rules"
         Add-Line
         $journal = @()
-        try { $journal = @(Get-JournalRule) } catch { Add-LogEntry -Section 'Journal rules' -Reason $_.Exception.Message }
+        try { $journal = @(Get-JournalRule) } catch { Add-LogEntry -Section 'Journal rules' -ErrorRecord $_ }
         $journalRows = @($journal | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -879,7 +1155,7 @@ function Get-MailFlowSection {
         Add-Line "### High Volume Email (HVE) accounts"
         Add-Line
         $hve = @()
-        try { $hve = @(Get-MailUser -HVEAccount -ResultSize Unlimited) } catch { Add-LogEntry -Section 'HVE accounts' -Reason $_.Exception.Message }
+        try { $hve = @(Get-MailUser -HVEAccount -ResultSize Unlimited) } catch { Add-LogEntry -Section 'HVE accounts' -ErrorRecord $_ }
         if ($hve.Count -eq 0) {
             Add-Line "No HVE accounts in use."
             Add-Line
@@ -916,7 +1192,7 @@ function Get-MailFlowSection {
         $acceptedNames = @($script:AcceptedDomains | ForEach-Object { "$($_.DomainName)".ToLower() })
         $dirCounts = [ordered]@{ Internal = 0; Outbound = 0; Inbound = 0; Other = 0 }
         foreach ($msg in $trace) {
-            $dirCounts[(Get-MessageDirection -Sender $msg.SenderAddress -Recipient $msg.RecipientAddress -Domains $acceptedNames)]++
+            $dirCounts[(Get-MessageDirection -SenderAddress $msg.SenderAddress -RecipientAddress $msg.RecipientAddress -Domains $acceptedNames)]++
         }
         $dirRows = @($dirCounts.GetEnumerator() | ForEach-Object {
             [PSCustomObject]@{ Direction = $_.Key; Count = $_.Value }
@@ -933,19 +1209,19 @@ function Get-MailFlowSection {
 function Get-HybridSection {
     Invoke-Section -Title $script:SectionTitles.Hybrid -Body {
         $rows = @()
-        try { $opo = @(Get-OnPremisesOrganization) } catch { $opo = @(); Add-LogEntry -Section 'OnPremisesOrganization' -Reason $_.Exception.Message }
+        try { $opo = @(Get-OnPremisesOrganization) } catch { $opo = @(); Add-LogEntry -Section 'OnPremisesOrganization' -ErrorRecord $_ }
         $rows += @($opo | ForEach-Object {
             [PSCustomObject]@{ Type = 'OnPremisesOrganization'; Name = $_.Name; Details = "HybridDomains=$($_.HybridDomains); Guid=$($_.Guid)" }
         })
-        try { $ioc = @(Get-IntraOrganizationConnector) } catch { $ioc = @(); Add-LogEntry -Section 'IntraOrganizationConnector' -Reason $_.Exception.Message }
+        try { $ioc = @(Get-IntraOrganizationConnector) } catch { $ioc = @(); Add-LogEntry -Section 'IntraOrganizationConnector' -ErrorRecord $_ }
         $rows += @($ioc | ForEach-Object {
             [PSCustomObject]@{ Type = 'IntraOrganizationConnector'; Name = $_.Name; Details = "Enabled=$($_.Enabled); TargetAddressDomains=$($_.TargetAddressDomains); DiscoveryEndpoint=$($_.DiscoveryEndpoint)" }
         })
-        try { $mep = @(Get-MigrationEndpoint) } catch { $mep = @(); Add-LogEntry -Section 'MigrationEndpoint' -Reason $_.Exception.Message }
+        try { $mep = @(Get-MigrationEndpoint) } catch { $mep = @(); Add-LogEntry -Section 'MigrationEndpoint' -ErrorRecord $_ }
         $rows += @($mep | ForEach-Object {
             [PSCustomObject]@{ Type = 'MigrationEndpoint'; Name = $_.Identity; Details = "RemoteServer=$($_.RemoteServer); ExchangeVersion=$($_.ExchangeVersion)" }
         })
-        try { $batch = @(Get-MigrationBatch) } catch { $batch = @(); Add-LogEntry -Section 'MigrationBatch' -Reason $_.Exception.Message }
+        try { $batch = @(Get-MigrationBatch) } catch { $batch = @(); Add-LogEntry -Section 'MigrationBatch' -ErrorRecord $_ }
         $rows += @($batch | ForEach-Object {
             [PSCustomObject]@{ Type = 'MigrationBatch'; Name = $_.Identity; Details = "Status=$($_.Status); TotalCount=$($_.TotalCount); FinalizedCount=$($_.FinalizedCount)" }
         })
@@ -959,7 +1235,7 @@ function Get-SharingSection {
         Add-Line "### Organization relationships"
         Add-Line
         $rel = @()
-        try { $rel = @(Get-OrganizationRelationship) } catch { Add-LogEntry -Section 'OrganizationRelationship' -Reason $_.Exception.Message }
+        try { $rel = @(Get-OrganizationRelationship) } catch { Add-LogEntry -Section 'OrganizationRelationship' -ErrorRecord $_ }
         $relRows = @($rel | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -974,7 +1250,7 @@ function Get-SharingSection {
         Add-Line "### Sharing policies"
         Add-Line
         $sp = @()
-        try { $sp = @(Get-SharingPolicy) } catch { Add-LogEntry -Section 'SharingPolicy' -Reason $_.Exception.Message }
+        try { $sp = @(Get-SharingPolicy) } catch { Add-LogEntry -Section 'SharingPolicy' -ErrorRecord $_ }
         $spRows = @($sp | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -988,7 +1264,7 @@ function Get-SharingSection {
         Add-Line "### Availability address spaces"
         Add-Line
         $aas = @()
-        try { $aas = @(Get-AvailabilityAddressSpace) } catch { Add-LogEntry -Section 'AvailabilityAddressSpace' -Reason $_.Exception.Message }
+        try { $aas = @(Get-AvailabilityAddressSpace) } catch { Add-LogEntry -Section 'AvailabilityAddressSpace' -ErrorRecord $_ }
         $aasRows = @($aas | ForEach-Object {
             [PSCustomObject]@{ Name = $_.Name; ForestName = $_.ForestName; AccessMethod = $_.AccessMethod }
         })
@@ -1001,7 +1277,7 @@ function Get-ClientAccessSection {
         Add-Line "### OWA mailbox policies"
         Add-Line
         $owa = @()
-        try { $owa = @(Get-OwaMailboxPolicy) } catch { Add-LogEntry -Section 'OwaMailboxPolicy' -Reason $_.Exception.Message }
+        try { $owa = @(Get-OwaMailboxPolicy) } catch { Add-LogEntry -Section 'OwaMailboxPolicy' -ErrorRecord $_ }
         $owaRows = @($owa | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -1018,13 +1294,13 @@ function Get-ClientAccessSection {
         Add-Line "### ActiveSync organization settings and access rules"
         Add-Line
         $aso = @()
-        try { $aso = @(Get-ActiveSyncOrganizationSettings) } catch { Add-LogEntry -Section 'ActiveSyncOrganizationSettings' -Reason $_.Exception.Message }
+        try { $aso = @(Get-ActiveSyncOrganizationSettings) } catch { Add-LogEntry -Section 'ActiveSyncOrganizationSettings' -ErrorRecord $_ }
         $asoRows = @($aso | ForEach-Object {
             [PSCustomObject]@{ DefaultAccessLevel = $_.DefaultAccessLevel; UserMailInsert = $_.UserMailInsert; AdminMailRecipients = $_.AdminMailRecipients }
         })
         Out-Table -CsvName "ActiveSyncOrgSettings" -Rows $asoRows -Columns @('DefaultAccessLevel','UserMailInsert','AdminMailRecipients')
         $asr = @()
-        try { $asr = @(Get-ActiveSyncDeviceAccessRule) } catch { Add-LogEntry -Section 'ActiveSyncDeviceAccessRule' -Reason $_.Exception.Message }
+        try { $asr = @(Get-ActiveSyncDeviceAccessRule) } catch { Add-LogEntry -Section 'ActiveSyncDeviceAccessRule' -ErrorRecord $_ }
         $asrRows = @($asr | ForEach-Object {
             [PSCustomObject]@{ Name = $_.Name; Characteristic = $_.Characteristic; QueryString = $_.QueryString; AccessLevel = $_.AccessLevel }
         })
@@ -1033,7 +1309,7 @@ function Get-ClientAccessSection {
         Add-Line "### Mobile device mailbox policies"
         Add-Line
         $mdp = @()
-        try { $mdp = @(Get-MobileDeviceMailboxPolicy) } catch { Add-LogEntry -Section 'MobileDeviceMailboxPolicy' -Reason $_.Exception.Message }
+        try { $mdp = @(Get-MobileDeviceMailboxPolicy) } catch { Add-LogEntry -Section 'MobileDeviceMailboxPolicy' -ErrorRecord $_ }
         $mdpRows = @($mdp | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -1049,21 +1325,21 @@ function Get-ClientAccessSection {
         Add-Line "### Protocol usage counts"
         Add-Line
         $cas = @()
-        try { $cas = Get-SharedCasMailboxes } catch { Add-LogEntry -Section 'CAS mailboxes' -Reason $_.Exception.Message }
-        Out-Table -CsvName "ProtocolUsage" -Columns @('Protocol','Enabled','Disabled') -Rows @(
-            [PSCustomObject]@{ Protocol = 'POP'; Enabled = @($cas | Where-Object { $_.PopEnabled }).Count; Disabled = @($cas | Where-Object { -not $_.PopEnabled }).Count }
-            [PSCustomObject]@{ Protocol = 'IMAP'; Enabled = @($cas | Where-Object { $_.ImapEnabled }).Count; Disabled = @($cas | Where-Object { -not $_.ImapEnabled }).Count }
-            [PSCustomObject]@{ Protocol = 'EWS'; Enabled = @($cas | Where-Object { $_.EwsEnabled }).Count; Disabled = @($cas | Where-Object { -not $_.EwsEnabled }).Count }
-            [PSCustomObject]@{ Protocol = 'ActiveSync'; Enabled = @($cas | Where-Object { $_.ActiveSyncEnabled }).Count; Disabled = @($cas | Where-Object { -not $_.ActiveSyncEnabled }).Count }
-            [PSCustomObject]@{ Protocol = 'MAPI'; Enabled = @($cas | Where-Object { $_.MapiEnabled }).Count; Disabled = @($cas | Where-Object { -not $_.MapiEnabled }).Count }
-            [PSCustomObject]@{ Protocol = 'OWA'; Enabled = @($cas | Where-Object { $_.OWAEnabled }).Count; Disabled = @($cas | Where-Object { -not $_.OWAEnabled }).Count }
-            [PSCustomObject]@{ Protocol = 'SMTP AUTH'; Enabled = @($cas | Where-Object { $_.SmtpClientAuthenticationDisabled -eq $false }).Count; Disabled = @($cas | Where-Object { $_.SmtpClientAuthenticationDisabled -eq $true }).Count }
+        try { $cas = Get-SharedCasMailboxes } catch { Add-LogEntry -Section 'CAS mailboxes' -ErrorRecord $_ }
+        Out-Table -CsvName "ProtocolUsage" -Columns @('Protocol','Enabled','Disabled','FollowsOrgSetting') -Rows @(
+            [PSCustomObject]@{ Protocol = 'POP'; Enabled = @($cas | Where-Object { Test-IsTrue $_.PopEnabled }).Count; Disabled = @($cas | Where-Object { -not (Test-IsTrue $_.PopEnabled) }).Count; FollowsOrgSetting = $null }
+            [PSCustomObject]@{ Protocol = 'IMAP'; Enabled = @($cas | Where-Object { Test-IsTrue $_.ImapEnabled }).Count; Disabled = @($cas | Where-Object { -not (Test-IsTrue $_.ImapEnabled) }).Count; FollowsOrgSetting = $null }
+            [PSCustomObject]@{ Protocol = 'EWS'; Enabled = @($cas | Where-Object { Test-IsTrue $_.EwsEnabled }).Count; Disabled = @($cas | Where-Object { -not (Test-IsTrue $_.EwsEnabled) }).Count; FollowsOrgSetting = $null }
+            [PSCustomObject]@{ Protocol = 'ActiveSync'; Enabled = @($cas | Where-Object { Test-IsTrue $_.ActiveSyncEnabled }).Count; Disabled = @($cas | Where-Object { -not (Test-IsTrue $_.ActiveSyncEnabled) }).Count; FollowsOrgSetting = $null }
+            [PSCustomObject]@{ Protocol = 'MAPI'; Enabled = @($cas | Where-Object { Test-IsTrue $_.MapiEnabled }).Count; Disabled = @($cas | Where-Object { -not (Test-IsTrue $_.MapiEnabled) }).Count; FollowsOrgSetting = $null }
+            [PSCustomObject]@{ Protocol = 'OWA'; Enabled = @($cas | Where-Object { Test-IsTrue $_.OWAEnabled }).Count; Disabled = @($cas | Where-Object { -not (Test-IsTrue $_.OWAEnabled) }).Count; FollowsOrgSetting = $null }
+            [PSCustomObject]@{ Protocol = 'SMTP AUTH'; Enabled = @($cas | Where-Object { "$($_.SmtpClientAuthenticationDisabled)" -eq 'False' }).Count; Disabled = @($cas | Where-Object { "$($_.SmtpClientAuthenticationDisabled)" -eq 'True' }).Count; FollowsOrgSetting = @($cas | Where-Object { $null -eq $_.SmtpClientAuthenticationDisabled -or "$($_.SmtpClientAuthenticationDisabled)" -eq '' }).Count }
         )
 
         Add-Line "### Authentication policies"
         Add-Line
         $ap = @()
-        try { $ap = @(Get-AuthenticationPolicy) } catch { Add-LogEntry -Section 'AuthenticationPolicy' -Reason $_.Exception.Message }
+        try { $ap = @(Get-AuthenticationPolicy) } catch { Add-LogEntry -Section 'AuthenticationPolicy' -ErrorRecord $_ }
         $apRows = @($ap | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -1093,24 +1369,26 @@ function Get-PermissionsSection {
         Add-Line "### Role groups and members"
         Add-Line
         $rg = @()
-        try { $rg = @(Get-RoleGroup) } catch { Add-LogEntry -Section 'RoleGroup' -Reason $_.Exception.Message }
+        try { $rg = @(Get-RoleGroup) } catch { Add-LogEntry -Section 'RoleGroup' -ErrorRecord $_ }
         $rgRows = @()
         foreach ($g in $rg) {
             $members = @()
-            try { $members = @(Get-RoleGroupMember -Identity $_.Name -ErrorAction Stop) } catch { }
+            try { $members = @(Get-RoleGroupMember -Identity $g.Name) } catch { Add-LogEntry -Section "RoleGroupMember ($($g.Name))" -ErrorRecord $_ }
+            $info = Get-RoleGroupMemberInfo -Members $members
             $rgRows += [PSCustomObject]@{
-                RoleGroup = $g.Name
-                MemberCount = $members.Count
-                Members = @($members | ForEach-Object { $_.Name }) -join '; '
-                ManagedBy = $g.ManagedBy
+                RoleGroup = (Get-RoleGroupDisplayName $g.Name)
+                Members = $info.Summary
+                GroupMembers = $info.Groups -join '; '
+                UserMembers = $info.Users -join '; '
+                ManagedBy = @($g.ManagedBy) -join '; '
             }
         }
-        Out-Table -CsvName "RoleGroups" -Rows $rgRows -Columns @('RoleGroup','MemberCount','Members','ManagedBy')
+        Out-Table -CsvName "RoleGroups" -Rows $rgRows -Columns @('RoleGroup','Members','GroupMembers','UserMembers')
 
         Add-Line "### Role assignment policies (user roles)"
         Add-Line
         $rap = @()
-        try { $rap = @(Get-RoleAssignmentPolicy) } catch { Add-LogEntry -Section 'RoleAssignmentPolicy' -Reason $_.Exception.Message }
+        try { $rap = @(Get-RoleAssignmentPolicy) } catch { Add-LogEntry -Section 'RoleAssignmentPolicy' -ErrorRecord $_ }
         $mbx = @()
         try { $mbx = Get-SharedMailboxes } catch { }
         $rapRows = @($rap | ForEach-Object {
@@ -1118,17 +1396,18 @@ function Get-PermissionsSection {
             $count = @($mbx | Where-Object { $_.RoleAssignmentPolicy -eq $rapName }).Count
             [PSCustomObject]@{
                 Name = $rapName
+                Description = $_.Description
                 IsDefault = $_.IsDefault
-                AssignedRoles = @($_.AssignedRoles | ForEach-Object { $_.Name }) -join '; '
+                AssignedRoles = @($_.AssignedRoles | ForEach-Object { if ($_ -is [string]) { $_ } elseif ($_.Name) { "$($_.Name)" } else { "$_" } } | Sort-Object) -join '; '
                 MailboxCount = $count
             }
         })
-        Out-Table -CsvName "RoleAssignmentPolicies" -Rows $rapRows -Columns @('Name','IsDefault','AssignedRoles','MailboxCount')
+        Out-Table -CsvName "RoleAssignmentPolicies" -Rows $rapRows -Columns @('Name','Description','IsDefault','AssignedRoles','MailboxCount')
 
         Add-Line "### Custom management roles"
         Add-Line
         $customRoles = @()
-        try { $customRoles = @(Get-ManagementRole | Where-Object { -not $_.IsEndUserRole -and -not $_.IsRootRole } ) } catch { Add-LogEntry -Section 'Custom management roles' -Reason $_.Exception.Message }
+        try { $customRoles = @(Get-ManagementRole | Where-Object { -not (Test-IsTrue $_.IsEndUserRole) -and -not (Test-IsTrue $_.IsRootRole) } ) } catch { Add-LogEntry -Section 'Custom management roles' -ErrorRecord $_ }
         $crRows = @($customRoles | ForEach-Object {
             [PSCustomObject]@{ Name = $_.Name; Parent = $_.Parent; RoleType = $_.RoleType }
         })
@@ -1137,31 +1416,39 @@ function Get-PermissionsSection {
         Add-Line "### Direct user role assignments"
         Add-Line
         $assignments = @()
-        try { $assignments = @(Get-ManagementRoleAssignment -RoleAssigneeType User) } catch { Add-LogEntry -Section 'Direct role assignments' -Reason $_.Exception.Message }
+        try { $assignments = @(Get-ManagementRoleAssignment -RoleAssigneeType User) } catch { Add-LogEntry -Section 'Direct role assignments' -ErrorRecord $_ }
         $asRows = @($assignments | ForEach-Object {
             [PSCustomObject]@{
+                Name = $_.Name
                 Role = $_.Role
                 RoleAssignee = $_.RoleAssigneeName
                 AssignmentMethod = $_.AssignmentMethod
+                Enabled = $_.Enabled
+                RecipientReadScope = $_.RecipientReadScope
+                RecipientWriteScope = $_.RecipientWriteScope
+                ConfigReadScope = $_.ConfigReadScope
+                ConfigWriteScope = $_.ConfigWriteScope
                 CustomRecipientWriteScope = $_.CustomRecipientWriteScope
+                CustomConfigWriteScope = $_.CustomConfigWriteScope
                 RecipientAdministrativeUnitScope = $_.RecipientAdministrativeUnitScope
             }
         })
-        Out-Table -CsvName "DirectRoleAssignments" -Rows $asRows -Columns @('Role','RoleAssignee','AssignmentMethod','CustomRecipientWriteScope','RecipientAdministrativeUnitScope')
+        Out-Table -CsvName "DirectRoleAssignments" -Rows $asRows -Columns @('Name','Role','RoleAssignee','AssignmentMethod','Enabled','RecipientReadScope','RecipientWriteScope','ConfigReadScope','ConfigWriteScope','CustomRecipientWriteScope','CustomConfigWriteScope','RecipientAdministrativeUnitScope')
 
         Add-Line "### Management scopes"
         Add-Line
         $scopes = @()
-        try { $scopes = @(Get-ManagementScope | Where-Object { -not $_.Exclusive }) } catch { Add-LogEntry -Section 'ManagementScope' -Reason $_.Exception.Message }
+        try { $scopes = @(Get-ManagementScope) } catch { Add-LogEntry -Section 'ManagementScope' -ErrorRecord $_ }
         $scRows = @($scopes | ForEach-Object {
-            [PSCustomObject]@{ Name = $_.Name; RecipientRestrictionFilter = $_.RecipientRestrictionFilter; Exclusive = $_.Exclusive }
+            [PSCustomObject]@{ Name = $_.Name; ScopeRestrictionType = $_.ScopeRestrictionType; Exclusive = $_.Exclusive
+                              RecipientRoot = $_.RecipientRoot; RecipientFilter = $_.RecipientFilter }
         })
-        Out-Table -CsvName "ManagementScopes" -Rows $scRows -Columns @('Name','RecipientRestrictionFilter','Exclusive')
+        Out-Table -CsvName "ManagementScopes" -Rows $scRows -Columns @('Name','ScopeRestrictionType','Exclusive','RecipientRoot','RecipientFilter')
 
         Add-Line "### RBAC for Applications"
         Add-Line
         $sps = @()
-        try { $sps = @(Get-ServicePrincipal) } catch { Add-LogEntry -Section 'ServicePrincipal' -Reason $_.Exception.Message }
+        try { $sps = @(Get-ServicePrincipal) } catch { Add-LogEntry -Section 'ServicePrincipal' -ErrorRecord $_ }
         $spAssignments = @()
         try {
             $spAssignments = @(Get-ManagementRoleAssignment -RoleAssigneeType ServicePrincipal -ErrorAction Stop)
@@ -1176,7 +1463,7 @@ function Get-PermissionsSection {
                 })
                 Add-LogEntry -Section 'SP role assignments' -Reason "-RoleAssigneeType ServicePrincipal unsupported; fell back to client-side filtering"
             }
-            catch { Add-LogEntry -Section 'SP role assignments' -Reason $_.Exception.Message }
+            catch { Add-LogEntry -Section 'SP role assignments' -ErrorRecord $_ }
         }
         $spById = @{}
         foreach ($sp in $sps) {
@@ -1241,199 +1528,310 @@ function Get-ThreatProtectionSection {
             Add-Line
         }
 
+        $presetRulesFailed = $false
+        $eopRules = @()
+        try { $eopRules = @(Get-EOPProtectionPolicyRule) } catch { $presetRulesFailed = $true; Add-LogEntry -Section 'EOPProtectionPolicyRule' -ErrorRecord $_ }
+        $atpPresetRules = @()
+        try { $atpPresetRules = @(Get-ATPProtectionPolicyRule) } catch { $presetRulesFailed = $true; Add-LogEntry -Section 'ATPProtectionPolicyRule' -ErrorRecord $_ }
+        $presetRules = @($eopRules) + @($atpPresetRules)
+        $builtInRules = @()
+        try { $builtInRules = @(Get-ATPBuiltInProtectionRule) } catch { $presetRulesFailed = $true; Add-LogEntry -Section 'ATPBuiltInProtectionRule' -ErrorRecord $_ }
+
         Add-Line "### Anti-phishing policies"
         Add-Line
         $phish = @()
-        try { $phish = @(Get-AntiPhishPolicy) } catch { Add-LogEntry -Section 'AntiPhishPolicy' -Reason $_.Exception.Message }
-        $phishRules = @()
-        try { $phishRules = @(Get-AntiPhishRule) } catch { }
+        try { $phish = @(Get-AntiPhishPolicy) } catch { Add-LogEntry -Section 'AntiPhishPolicy' -ErrorRecord $_ }
+        $phishRules = @(); $phishRulesFailed = $false
+        try { $phishRules = @(Get-AntiPhishRule) } catch { $phishRulesFailed = $true; Add-LogEntry -Section 'AntiPhishRule' -ErrorRecord $_ }
         $pRows = @($phish | ForEach-Object {
-            $r = @($phishRules | Where-Object { $_.AntiPhishPolicy -eq $_.Name }) | Select-Object -First 1
+            $pol = $_
+            $r = @($phishRules | Where-Object { $_.AntiPhishPolicy -eq $pol.Name }) | Select-Object -First 1
+            $i = Get-PolicyRuleInfo -Policy $pol -Rule $r -PresetRules $presetRules -BuiltInRules $builtInRules -RuleLookupFailed:($phishRulesFailed -or $presetRulesFailed)
             [PSCustomObject]@{
-                Name = $_.Name
-                Enabled = $_.Enabled
-                RuleState = $r.State
-                RulePriority = $r.Priority
-                ImpersonationAction = $_.TargetedUserProtectionAction
-                EnableTargetedUserProtection = $_.EnableTargetedUserProtection
-                EnableOrganizationDomainsProtection = $_.EnableOrganizationDomainsProtection
-                EnableMailboxIntelligence = $_.EnableMailboxIntelligence
-                EnableMailboxIntelligenceProtection = $_.EnableMailboxIntelligenceProtection
-                EnableSpoofIntelligence = $_.EnableSpoofIntelligence
-                AuthenticationFailAction = $_.AuthenticationFailAction
-                HonorDmarcPolicy = $_.HonorDmarcPolicy
-                PhishThresholdLevel = $_.PhishThresholdLevel
-                TargetedDomainProtectionAction = $_.TargetedDomainProtectionAction
-                IncludedUsers = $r.SentTo
-                IncludedGroups = $r.SentToMemberOf
-                IncludedDomains = $r.RecipientDomainIs
+                Name = $pol.Name
+                Status = $i.Status
+                Priority = $i.Priority
+                AppliesTo = $i.AppliesTo
+                IncludedUsers = $i.IncludedUsers
+                IncludedGroups = $i.IncludedGroups
+                IncludedDomains = $i.IncludedDomains
+                ExcludedUsers = $i.ExcludedUsers
+                ExcludedGroups = $i.ExcludedGroups
+                ExcludedDomains = $i.ExcludedDomains
+                PhishThresholdLevel = $pol.PhishThresholdLevel
+                EnableTargetedUserProtection = $pol.EnableTargetedUserProtection
+                TargetedUsersToProtect = $pol.TargetedUsersToProtect
+                EnableOrganizationDomainsProtection = $pol.EnableOrganizationDomainsProtection
+                EnableTargetedDomainsProtection = $pol.EnableTargetedDomainsProtection
+                TargetedDomainsToProtect = $pol.TargetedDomainsToProtect
+                PolicyExcludedSenders = $pol.ExcludedSenders
+                PolicyExcludedDomains = $pol.ExcludedDomains
+                EnableMailboxIntelligence = $pol.EnableMailboxIntelligence
+                EnableMailboxIntelligenceProtection = $pol.EnableMailboxIntelligenceProtection
+                EnableSpoofIntelligence = $pol.EnableSpoofIntelligence
+                TargetedUserProtectionAction = $pol.TargetedUserProtectionAction
+                TargetedUserQuarantineTag = $pol.TargetedUserQuarantineTag
+                TargetedDomainProtectionAction = $pol.TargetedDomainProtectionAction
+                TargetedDomainQuarantineTag = $pol.TargetedDomainQuarantineTag
+                MailboxIntelligenceProtectionAction = $pol.MailboxIntelligenceProtectionAction
+                MailboxIntelligenceQuarantineTag = $pol.MailboxIntelligenceQuarantineTag
+                HonorDmarcPolicy = $pol.HonorDmarcPolicy
+                DmarcQuarantineAction = $pol.DmarcQuarantineAction
+                DmarcRejectAction = $pol.DmarcRejectAction
+                AuthenticationFailAction = $pol.AuthenticationFailAction
+                SpoofQuarantineTag = $pol.SpoofQuarantineTag
+                EnableFirstContactSafetyTips = $pol.EnableFirstContactSafetyTips
+                EnableSimilarUsersSafetyTips = $pol.EnableSimilarUsersSafetyTips
+                EnableSimilarDomainsSafetyTips = $pol.EnableSimilarDomainsSafetyTips
+                EnableUnusualCharactersSafetyTips = $pol.EnableUnusualCharactersSafetyTips
+                EnableUnauthenticatedSender = $pol.EnableUnauthenticatedSender
+                EnableViaTag = $pol.EnableViaTag
             }
         })
-        Out-Table -CsvName "AntiPhishPolicies" -Rows $pRows -Columns @('Name','Enabled','RuleState','RulePriority','EnableTargetedUserProtection','ImpersonationAction','EnableOrganizationDomainsProtection','EnableMailboxIntelligence','EnableMailboxIntelligenceProtection','EnableSpoofIntelligence','AuthenticationFailAction','HonorDmarcPolicy','PhishThresholdLevel','TargetedDomainProtectionAction','IncludedUsers','IncludedGroups','IncludedDomains')
+        Out-Table -CsvName "AntiPhishPolicies" -Rows $pRows -Columns @('Name','Status','Priority','AppliesTo','IncludedUsers','IncludedGroups','IncludedDomains','ExcludedUsers','ExcludedGroups','ExcludedDomains','PhishThresholdLevel','EnableTargetedUserProtection','TargetedUsersToProtect','EnableOrganizationDomainsProtection','EnableTargetedDomainsProtection','TargetedDomainsToProtect','PolicyExcludedSenders','PolicyExcludedDomains','EnableMailboxIntelligence','EnableMailboxIntelligenceProtection','EnableSpoofIntelligence','TargetedUserProtectionAction','TargetedUserQuarantineTag','TargetedDomainProtectionAction','TargetedDomainQuarantineTag','MailboxIntelligenceProtectionAction','MailboxIntelligenceQuarantineTag','HonorDmarcPolicy','DmarcQuarantineAction','DmarcRejectAction','AuthenticationFailAction','SpoofQuarantineTag','EnableFirstContactSafetyTips','EnableSimilarUsersSafetyTips','EnableSimilarDomainsSafetyTips','EnableUnusualCharactersSafetyTips','EnableUnauthenticatedSender','EnableViaTag')
 
         Add-Line "### Anti-spam inbound policies"
         Add-Line
         $spamIn = @()
-        try { $spamIn = @(Get-HostedContentFilterPolicy) } catch { Add-LogEntry -Section 'HostedContentFilterPolicy' -Reason $_.Exception.Message }
-        $spamInRules = @()
-        try { $spamInRules = @(Get-HostedContentFilterRule) } catch { }
+        try { $spamIn = @(Get-HostedContentFilterPolicy) } catch { Add-LogEntry -Section 'HostedContentFilterPolicy' -ErrorRecord $_ }
+        $spamInRules = @(); $spamInRulesFailed = $false
+        try { $spamInRules = @(Get-HostedContentFilterRule) } catch { $spamInRulesFailed = $true; Add-LogEntry -Section 'HostedContentFilterRule' -ErrorRecord $_ }
         $siRows = @($spamIn | ForEach-Object {
-            $r = @($spamInRules | Where-Object { $_.HostedContentFilterPolicy -eq $_.Name }) | Select-Object -First 1
+            $pol = $_
+            $r = @($spamInRules | Where-Object { $_.HostedContentFilterPolicy -eq $pol.Name }) | Select-Object -First 1
+            $i = Get-PolicyRuleInfo -Policy $pol -Rule $r -PresetRules $presetRules -BuiltInRules $builtInRules -RuleLookupFailed:($spamInRulesFailed -or $presetRulesFailed)
             [PSCustomObject]@{
-                Name = $_.Name
-                Enabled = $_.Enabled
-                RuleState = $r.State
-                RulePriority = $r.Priority
-                SpamAction = $_.SpamAction
-                HighConfidenceSpamAction = $_.HighConfidenceSpamAction
-                PhishSpamAction = $_.PhishSpamAction
-                HighConfidencePhishAction = $_.HighConfidencePhishAction
-                BulkSpamAction = $_.BulkSpamAction
-                BulkThreshold = $_.BulkThreshold
-                IncreaseScoreWithImageLinks = $_.IncreaseScoreWithImageLinks
-                AllowedSenders = $_.AllowedSenders
-                AllowedSenderDomains = $_.AllowedSenderDomains
-                BlockedSenders = $_.BlockedSenders
-                BlockedSenderDomains = $_.BlockedSenderDomains
-                QuarantineRetentionPeriod = $_.QuarantineRetentionPeriod
-                SpamQuarantineTag = $_.SpamQuarantineTag
-                HighConfidenceSpamQuarantineTag = $_.HighConfidenceSpamQuarantineTag
-                PhishQuarantineTag = $_.PhishQuarantineTag
-                HighConfidencePhishQuarantineTag = $_.HighConfidencePhishQuarantineTag
-                BulkQuarantineTag = $_.BulkQuarantineTag
+                Name = $pol.Name
+                Status = $i.Status
+                Priority = $i.Priority
+                AppliesTo = $i.AppliesTo
+                IncludedUsers = $i.IncludedUsers
+                IncludedGroups = $i.IncludedGroups
+                IncludedDomains = $i.IncludedDomains
+                ExcludedUsers = $i.ExcludedUsers
+                ExcludedGroups = $i.ExcludedGroups
+                ExcludedDomains = $i.ExcludedDomains
+                BulkThreshold = $pol.BulkThreshold
+                EnableLanguageBlockList = $pol.EnableLanguageBlockList
+                LanguageBlockList = $pol.LanguageBlockList
+                EnableRegionBlockList = $pol.EnableRegionBlockList
+                RegionBlockList = $pol.RegionBlockList
+                SpamAction = $pol.SpamAction
+                SpamQuarantineTag = $pol.SpamQuarantineTag
+                HighConfidenceSpamAction = $pol.HighConfidenceSpamAction
+                HighConfidenceSpamQuarantineTag = $pol.HighConfidenceSpamQuarantineTag
+                PhishSpamAction = $pol.PhishSpamAction
+                PhishQuarantineTag = $pol.PhishQuarantineTag
+                HighConfidencePhishAction = $pol.HighConfidencePhishAction
+                HighConfidencePhishQuarantineTag = $pol.HighConfidencePhishQuarantineTag
+                BulkSpamAction = $pol.BulkSpamAction
+                BulkQuarantineTag = $pol.BulkQuarantineTag
+                IntraOrgFilterState = $pol.IntraOrgFilterState
+                QuarantineRetentionPeriod = $pol.QuarantineRetentionPeriod
+                InlineSafetyTipsEnabled = $pol.InlineSafetyTipsEnabled
+                PhishZapEnabled = $pol.PhishZapEnabled
+                SpamZapEnabled = $pol.SpamZapEnabled
+                AllowedSenders = $pol.AllowedSenders
+                AllowedSenderDomains = $pol.AllowedSenderDomains
+                BlockedSenders = $pol.BlockedSenders
+                BlockedSenderDomains = $pol.BlockedSenderDomains
+                IncreaseScoreWithImageLinks = $pol.IncreaseScoreWithImageLinks
+                IncreaseScoreWithNumericIps = $pol.IncreaseScoreWithNumericIps
+                IncreaseScoreWithRedirectToOtherPort = $pol.IncreaseScoreWithRedirectToOtherPort
+                IncreaseScoreWithBizOrInfoUrls = $pol.IncreaseScoreWithBizOrInfoUrls
+                MarkAsSpamEmptyMessages = $pol.MarkAsSpamEmptyMessages
+                MarkAsSpamJavaScriptInHtml = $pol.MarkAsSpamJavaScriptInHtml
+                MarkAsSpamFramesInHtml = $pol.MarkAsSpamFramesInHtml
+                MarkAsSpamObjectTagsInHtml = $pol.MarkAsSpamObjectTagsInHtml
+                MarkAsSpamEmbedTagsInHtml = $pol.MarkAsSpamEmbedTagsInHtml
+                MarkAsSpamFormTagsInHtml = $pol.MarkAsSpamFormTagsInHtml
+                MarkAsSpamWebBugsInHtml = $pol.MarkAsSpamWebBugsInHtml
+                MarkAsSpamSensitiveWordList = $pol.MarkAsSpamSensitiveWordList
+                MarkAsSpamSpfRecordHardFail = $pol.MarkAsSpamSpfRecordHardFail
+                MarkAsSpamFromAddressAuthFail = $pol.MarkAsSpamFromAddressAuthFail
+                MarkAsSpamNdrBackscatter = $pol.MarkAsSpamNdrBackscatter
+                MarkAsSpamBulkMail = $pol.MarkAsSpamBulkMail
+                TestModeAction = $pol.TestModeAction
             }
         })
-        Out-Table -CsvName "AntiSpamInboundPolicies" -Rows $siRows -Columns @('Name','Enabled','RuleState','RulePriority','SpamAction','HighConfidenceSpamAction','PhishSpamAction','HighConfidencePhishAction','BulkSpamAction','BulkThreshold','AllowedSenders','AllowedSenderDomains','BlockedSenders','BlockedSenderDomains','QuarantineRetentionPeriod','SpamQuarantineTag','HighConfidenceSpamQuarantineTag','PhishQuarantineTag','HighConfidencePhishQuarantineTag','BulkQuarantineTag')
+        Out-Table -CsvName "AntiSpamInboundPolicies" -Rows $siRows -Columns @('Name','Status','Priority','AppliesTo','IncludedUsers','IncludedGroups','IncludedDomains','ExcludedUsers','ExcludedGroups','ExcludedDomains','BulkThreshold','EnableLanguageBlockList','LanguageBlockList','EnableRegionBlockList','RegionBlockList','SpamAction','SpamQuarantineTag','HighConfidenceSpamAction','HighConfidenceSpamQuarantineTag','PhishSpamAction','PhishQuarantineTag','HighConfidencePhishAction','HighConfidencePhishQuarantineTag','BulkSpamAction','BulkQuarantineTag','IntraOrgFilterState','QuarantineRetentionPeriod','InlineSafetyTipsEnabled','PhishZapEnabled','SpamZapEnabled','AllowedSenders','AllowedSenderDomains','BlockedSenders','BlockedSenderDomains','IncreaseScoreWithImageLinks','IncreaseScoreWithNumericIps','IncreaseScoreWithRedirectToOtherPort','IncreaseScoreWithBizOrInfoUrls','MarkAsSpamEmptyMessages','MarkAsSpamJavaScriptInHtml','MarkAsSpamFramesInHtml','MarkAsSpamObjectTagsInHtml','MarkAsSpamEmbedTagsInHtml','MarkAsSpamFormTagsInHtml','MarkAsSpamWebBugsInHtml','MarkAsSpamSensitiveWordList','MarkAsSpamSpfRecordHardFail','MarkAsSpamFromAddressAuthFail','MarkAsSpamNdrBackscatter','MarkAsSpamBulkMail','TestModeAction')
 
         Add-Line "### Connection filter policy"
         Add-Line
         $cf = @()
-        try { $cf = @(Get-HostedConnectionFilterPolicy) } catch { Add-LogEntry -Section 'HostedConnectionFilterPolicy' -Reason $_.Exception.Message }
+        try { $cf = @(Get-HostedConnectionFilterPolicy) } catch { Add-LogEntry -Section 'HostedConnectionFilterPolicy' -ErrorRecord $_ }
         $cfRows = @($cf | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
-                Enabled = $_.Enabled
+                Status = 'On (tenant-wide policy)'
                 IPAllowList = $_.IPAllowList
                 IPBlockList = $_.IPBlockList
                 EnableSafeList = $_.EnableSafeList
             }
         })
-        Out-Table -CsvName "ConnectionFilterPolicy" -Rows $cfRows -Columns @('Name','Enabled','IPAllowList','IPBlockList','EnableSafeList')
+        Out-Table -CsvName "ConnectionFilterPolicy" -Rows $cfRows -Columns @('Name','Status','IPAllowList','IPBlockList','EnableSafeList')
 
         Add-Line "### Outbound spam policies"
         Add-Line
         $spamOut = @()
-        try { $spamOut = @(Get-HostedOutboundSpamFilterPolicy) } catch { Add-LogEntry -Section 'HostedOutboundSpamFilterPolicy' -Reason $_.Exception.Message }
+        try { $spamOut = @(Get-HostedOutboundSpamFilterPolicy) } catch { Add-LogEntry -Section 'HostedOutboundSpamFilterPolicy' -ErrorRecord $_ }
+        $spamOutRules = @(); $spamOutRulesFailed = $false
+        try { $spamOutRules = @(Get-HostedOutboundSpamFilterRule) } catch { $spamOutRulesFailed = $true; Add-LogEntry -Section 'HostedOutboundSpamFilterRule' -ErrorRecord $_ }
         $soRows = @($spamOut | ForEach-Object {
+            $pol = $_
+            $r = @($spamOutRules | Where-Object { $_.HostedOutboundSpamFilterPolicy -eq $pol.Name }) | Select-Object -First 1
+            $i = Get-PolicyRuleInfo -Policy $pol -Rule $r -PresetRules $presetRules -BuiltInRules $builtInRules -SenderBased -RuleLookupFailed:($spamOutRulesFailed -or $presetRulesFailed)
             [PSCustomObject]@{
-                Name = $_.Name
-                Enabled = $_.Enabled
-                RecipientLimitExternalPerHour = $_.RecipientLimitExternalPerHour
-                RecipientLimitInternalPerHour = $_.RecipientLimitInternalPerHour
-                RecipientLimitPerDay = $_.RecipientLimitPerDay
-                AutoForwardingMode = $_.AutoForwardingMode
-                NotifyOutboundSpam = $_.NotifyOutboundSpam
-                NotifyOutboundSpamRecipients = $_.NotifyOutboundSpamRecipients
+                Name = $pol.Name
+                Status = $i.Status
+                Priority = $i.Priority
+                AppliesTo = $i.AppliesTo
+                IncludedSenders = $i.IncludedUsers
+                IncludedSenderGroups = $i.IncludedGroups
+                IncludedSenderDomains = $i.IncludedDomains
+                ExcludedSenders = $i.ExcludedUsers
+                ExcludedSenderGroups = $i.ExcludedGroups
+                ExcludedSenderDomains = $i.ExcludedDomains
+                RecipientLimitExternalPerHour = $pol.RecipientLimitExternalPerHour
+                RecipientLimitInternalPerHour = $pol.RecipientLimitInternalPerHour
+                RecipientLimitPerDay = $pol.RecipientLimitPerDay
+                ActionWhenThresholdReached = $pol.ActionWhenThresholdReached
+                AutoForwardingMode = $pol.AutoForwardingMode
+                BccSuspiciousOutboundMail = $pol.BccSuspiciousOutboundMail
+                BccSuspiciousOutboundAdditionalRecipients = $pol.BccSuspiciousOutboundAdditionalRecipients
+                NotifyOutboundSpam = $pol.NotifyOutboundSpam
+                NotifyOutboundSpamRecipients = $pol.NotifyOutboundSpamRecipients
             }
         })
-        Out-Table -CsvName "OutboundSpamPolicies" -Rows $soRows -Columns @('Name','Enabled','RecipientLimitExternalPerHour','RecipientLimitInternalPerHour','RecipientLimitPerDay','AutoForwardingMode','NotifyOutboundSpam','NotifyOutboundSpamRecipients')
+        Out-Table -CsvName "OutboundSpamPolicies" -Rows $soRows -Columns @('Name','Status','Priority','AppliesTo','IncludedSenders','IncludedSenderGroups','IncludedSenderDomains','ExcludedSenders','ExcludedSenderGroups','ExcludedSenderDomains','RecipientLimitExternalPerHour','RecipientLimitInternalPerHour','RecipientLimitPerDay','ActionWhenThresholdReached','AutoForwardingMode','BccSuspiciousOutboundMail','BccSuspiciousOutboundAdditionalRecipients','NotifyOutboundSpam','NotifyOutboundSpamRecipients')
 
         Add-Line "### Anti-malware policies"
         Add-Line
         $mal = @()
-        try { $mal = @(Get-MalwareFilterPolicy) } catch { Add-LogEntry -Section 'MalwareFilterPolicy' -Reason $_.Exception.Message }
-        $malRules = @()
-        try { $malRules = @(Get-MalwareFilterRule) } catch { }
+        try { $mal = @(Get-MalwareFilterPolicy) } catch { Add-LogEntry -Section 'MalwareFilterPolicy' -ErrorRecord $_ }
+        $malRules = @(); $malRulesFailed = $false
+        try { $malRules = @(Get-MalwareFilterRule) } catch { $malRulesFailed = $true; Add-LogEntry -Section 'MalwareFilterRule' -ErrorRecord $_ }
         $malRows = @($mal | ForEach-Object {
-            $r = @($malRules | Where-Object { $_.MalwareFilterPolicy -eq $_.Name }) | Select-Object -First 1
+            $pol = $_
+            $r = @($malRules | Where-Object { $_.MalwareFilterPolicy -eq $pol.Name }) | Select-Object -First 1
+            $i = Get-PolicyRuleInfo -Policy $pol -Rule $r -PresetRules $presetRules -BuiltInRules $builtInRules -RuleLookupFailed:($malRulesFailed -or $presetRulesFailed)
             [PSCustomObject]@{
-                Name = $_.Name
-                Enabled = $_.Enabled
-                RuleState = $r.State
-                RulePriority = $r.Priority
-                EnableFileFilter = $_.EnableFileFilter
-                FileTypeCount = @($_.FileTypes).Count
-                FileTypes = $_.FileTypes
-                ZapEnabled = $_.ZapEnabled
-                EnableInternalSenderAdminNotifications = $_.EnableInternalSenderAdminNotifications
-                InternalSenderAdminAddress = $_.InternalSenderAdminAddress
-                EnableExternalSenderAdminNotifications = $_.EnableExternalSenderAdminNotifications
-                ExternalSenderAdminAddress = $_.ExternalSenderAdminAddress
-                Action = $_.Action
+                Name = $pol.Name
+                Status = $i.Status
+                Priority = $i.Priority
+                AppliesTo = $i.AppliesTo
+                IncludedUsers = $i.IncludedUsers
+                IncludedGroups = $i.IncludedGroups
+                IncludedDomains = $i.IncludedDomains
+                ExcludedUsers = $i.ExcludedUsers
+                ExcludedGroups = $i.ExcludedGroups
+                ExcludedDomains = $i.ExcludedDomains
+                EnableFileFilter = $pol.EnableFileFilter
+                FileTypes = $pol.FileTypes
+                FileTypeAction = $pol.FileTypeAction
+                ZapEnabled = $pol.ZapEnabled
+                QuarantineTag = $pol.QuarantineTag
+                EnableInternalSenderAdminNotifications = $pol.EnableInternalSenderAdminNotifications
+                InternalSenderAdminAddress = $pol.InternalSenderAdminAddress
+                EnableExternalSenderAdminNotifications = $pol.EnableExternalSenderAdminNotifications
+                ExternalSenderAdminAddress = $pol.ExternalSenderAdminAddress
+                CustomNotifications = $pol.CustomNotifications
+                CustomFromName = $pol.CustomFromName
+                CustomFromAddress = $pol.CustomFromAddress
             }
         })
-        Out-Table -CsvName "MalwareFilterPolicies" -Rows $malRows -Columns @('Name','Enabled','RuleState','RulePriority','EnableFileFilter','FileTypeCount','FileTypes','ZapEnabled','EnableInternalSenderAdminNotifications','InternalSenderAdminAddress','EnableExternalSenderAdminNotifications','ExternalSenderAdminAddress','Action')
+        Out-Table -CsvName "MalwareFilterPolicies" -Rows $malRows -Columns @('Name','Status','Priority','AppliesTo','IncludedUsers','IncludedGroups','IncludedDomains','ExcludedUsers','ExcludedGroups','ExcludedDomains','EnableFileFilter','FileTypes','FileTypeAction','ZapEnabled','QuarantineTag','EnableInternalSenderAdminNotifications','InternalSenderAdminAddress','EnableExternalSenderAdminNotifications','ExternalSenderAdminAddress','CustomNotifications','CustomFromName','CustomFromAddress')
 
         Add-Line "### Safe Attachments policies"
         Add-Line
         $sa = @()
-        try { $sa = @(Get-SafeAttachmentPolicy) } catch { Add-LogEntry -Section 'SafeAttachmentPolicy' -Reason $_.Exception.Message }
-        $saRules = @()
-        try { $saRules = @(Get-SafeAttachmentRule) } catch { }
+        try { $sa = @(Get-SafeAttachmentPolicy) } catch { Add-LogEntry -Section 'SafeAttachmentPolicy' -ErrorRecord $_ }
+        $saRules = @(); $saRulesFailed = $false
+        try { $saRules = @(Get-SafeAttachmentRule) } catch { $saRulesFailed = $true; Add-LogEntry -Section 'SafeAttachmentRule' -ErrorRecord $_ }
         $saRows = @($sa | ForEach-Object {
-            $r = @($saRules | Where-Object { $_.SafeAttachmentPolicy -eq $_.Name }) | Select-Object -First 1
+            $pol = $_
+            $r = @($saRules | Where-Object { $_.SafeAttachmentPolicy -eq $pol.Name }) | Select-Object -First 1
+            $i = Get-PolicyRuleInfo -Policy $pol -Rule $r -PresetRules $presetRules -BuiltInRules $builtInRules -RuleLookupFailed:($saRulesFailed -or $presetRulesFailed)
             [PSCustomObject]@{
-                Name = $_.Name
-                Enable = $_.Enable
-                RuleState = $r.State
-                RulePriority = $r.Priority
-                Action = $_.Action
-                Redirect = $_.Redirect
-                RedirectAddress = $_.RedirectAddress
+                Name = $pol.Name
+                Status = $i.Status
+                Priority = $i.Priority
+                AppliesTo = $i.AppliesTo
+                IncludedUsers = $i.IncludedUsers
+                IncludedGroups = $i.IncludedGroups
+                IncludedDomains = $i.IncludedDomains
+                ExcludedUsers = $i.ExcludedUsers
+                ExcludedGroups = $i.ExcludedGroups
+                ExcludedDomains = $i.ExcludedDomains
+                Enable = $pol.Enable
+                Action = $pol.Action
+                QuarantineTag = $pol.QuarantineTag
+                Redirect = $pol.Redirect
+                RedirectAddress = $pol.RedirectAddress
+                EnableBlockingEncryptedAttachments = $pol.EnableBlockingEncryptedAttachments
+                ExcludedTypesFromBlockingEncryptedAttachments = $pol.ExcludedTypesFromBlockingEncryptedAttachments
+                QuarantineTagForBlockingEncryptedAttachments = $pol.QuarantineTagForBlockingEncryptedAttachments
             }
         })
-        Out-Table -CsvName "SafeAttachmentPolicies" -Rows $saRows -Columns @('Name','Enable','RuleState','RulePriority','Action','Redirect','RedirectAddress')
+        Out-Table -CsvName "SafeAttachmentPolicies" -Rows $saRows -Columns @('Name','Status','Priority','AppliesTo','IncludedUsers','IncludedGroups','IncludedDomains','ExcludedUsers','ExcludedGroups','ExcludedDomains','Enable','Action','QuarantineTag','Redirect','RedirectAddress','EnableBlockingEncryptedAttachments','ExcludedTypesFromBlockingEncryptedAttachments','QuarantineTagForBlockingEncryptedAttachments')
 
         Add-Line "### ATP policy for O365"
         Add-Line
         $atp = @()
-        try { $atp = @(Get-AtpPolicyForO365) } catch { Add-LogEntry -Section 'AtpPolicyForO365' -Reason $_.Exception.Message }
+        try { $atp = @(Get-AtpPolicyForO365) } catch { Add-LogEntry -Section 'AtpPolicyForO365' -ErrorRecord $_ }
         $atpRows = @($atp | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
                 EnableATPForSPOTeamsODB = $_.EnableATPForSPOTeamsODB
                 EnableSafeDocs = $_.EnableSafeDocs
                 AllowSafeDocsOpen = $_.AllowSafeDocsOpen
-                EnableSafeLinksForO365Clients = $_.EnableSafeLinksForO365Clients
-                TrackClicks = $_.TrackClicks
-                AllowClickThrough = $_.AllowClickThrough
             }
         })
-        Out-Table -CsvName "AtpPolicyForO365" -Rows $atpRows -Columns @('Name','EnableATPForSPOTeamsODB','EnableSafeDocs','AllowSafeDocsOpen','EnableSafeLinksForO365Clients','TrackClicks','AllowClickThrough')
+        Out-Table -CsvName "AtpPolicyForO365" -Rows $atpRows -Columns @('Name','EnableATPForSPOTeamsODB','EnableSafeDocs','AllowSafeDocsOpen')
 
         Add-Line "### Safe Links policies"
         Add-Line
         $sl = @()
-        try { $sl = @(Get-SafeLinksPolicy) } catch { Add-LogEntry -Section 'SafeLinksPolicy' -Reason $_.Exception.Message }
-        $slRules = @()
-        try { $slRules = @(Get-SafeLinksRule) } catch { }
+        try { $sl = @(Get-SafeLinksPolicy) } catch { Add-LogEntry -Section 'SafeLinksPolicy' -ErrorRecord $_ }
+        $slRules = @(); $slRulesFailed = $false
+        try { $slRules = @(Get-SafeLinksRule) } catch { $slRulesFailed = $true; Add-LogEntry -Section 'SafeLinksRule' -ErrorRecord $_ }
         $slRows = @($sl | ForEach-Object {
-            $r = @($slRules | Where-Object { $_.SafeLinksPolicy -eq $_.Name }) | Select-Object -First 1
+            $pol = $_
+            $r = @($slRules | Where-Object { $_.SafeLinksPolicy -eq $pol.Name }) | Select-Object -First 1
+            $i = Get-PolicyRuleInfo -Policy $pol -Rule $r -PresetRules $presetRules -BuiltInRules $builtInRules -RuleLookupFailed:($slRulesFailed -or $presetRulesFailed)
             [PSCustomObject]@{
-                Name = $_.Name
-                IsEnabled = $_.IsEnabled
-                RuleState = $r.State
-                RulePriority = $r.Priority
-                ScanUrl = $_.ScanUrl
-                EnableSafeLinksForEmail = $_.EnableSafeLinksForEmail
-                EnableSafeLinksForTeams = $_.EnableSafeLinksForTeams
-                EnableSafeLinksForOffice = $_.EnableSafeLinksForOffice
-                EnableForInternalSenders = $_.EnableForInternalSenders
-                TrackClicks = $_.TrackClicks
-                AllowClickThrough = $_.AllowClickThrough
-                DoNotRewriteUrls = $_.DoNotRewriteUrls
-                DeliverMessageAfterScan = $_.DeliverMessageAfterScan
-                DisableUrlRewrite = $_.DisableUrlRewrite
+                Name = $pol.Name
+                Status = $i.Status
+                Priority = $i.Priority
+                AppliesTo = $i.AppliesTo
+                IncludedUsers = $i.IncludedUsers
+                IncludedGroups = $i.IncludedGroups
+                IncludedDomains = $i.IncludedDomains
+                ExcludedUsers = $i.ExcludedUsers
+                ExcludedGroups = $i.ExcludedGroups
+                ExcludedDomains = $i.ExcludedDomains
+                EnableSafeLinksForEmail = $pol.EnableSafeLinksForEmail
+                EnableForInternalSenders = $pol.EnableForInternalSenders
+                ScanUrls = $pol.ScanUrls
+                DeliverMessageAfterScan = $pol.DeliverMessageAfterScan
+                DisableUrlRewrite = $pol.DisableUrlRewrite
+                DoNotRewriteUrls = $pol.DoNotRewriteUrls
+                EnableSafeLinksForTeams = $pol.EnableSafeLinksForTeams
+                EnableSafeLinksForOffice = $pol.EnableSafeLinksForOffice
+                TrackClicks = $pol.TrackClicks
+                AllowClickThrough = $pol.AllowClickThrough
+                EnableOrganizationBranding = $pol.EnableOrganizationBranding
+                CustomNotificationText = $pol.CustomNotificationText
+                UseTranslatedNotificationText = $pol.UseTranslatedNotificationText
             }
         })
-        Out-Table -CsvName "SafeLinksPolicies" -Rows $slRows -Columns @('Name','IsEnabled','RuleState','RulePriority','ScanUrl','EnableSafeLinksForEmail','EnableSafeLinksForTeams','EnableSafeLinksForOffice','EnableForInternalSenders','TrackClicks','AllowClickThrough','DoNotRewriteUrls','DeliverMessageAfterScan','DisableUrlRewrite')
+        Out-Table -CsvName "SafeLinksPolicies" -Rows $slRows -Columns @('Name','Status','Priority','AppliesTo','IncludedUsers','IncludedGroups','IncludedDomains','ExcludedUsers','ExcludedGroups','ExcludedDomains','EnableSafeLinksForEmail','EnableForInternalSenders','ScanUrls','DeliverMessageAfterScan','DisableUrlRewrite','DoNotRewriteUrls','EnableSafeLinksForTeams','EnableSafeLinksForOffice','TrackClicks','AllowClickThrough','EnableOrganizationBranding','CustomNotificationText','UseTranslatedNotificationText')
 
         Add-Line "### Preset security policies"
         Add-Line
         $presetRows = @()
         try {
-            $eop = @(Get-EOPProtectionPolicyRule)
-            $presetRows += @($eop | ForEach-Object {
+            $presetRows += @($eopRules | ForEach-Object {
                 [PSCustomObject]@{
                     Name = $_.Name
                     State = $_.State
@@ -1444,10 +1842,9 @@ function Get-ThreatProtectionSection {
                     RecipientDomainIs = $_.RecipientDomainIs
                 }
             })
-        } catch { Add-LogEntry -Section 'EOPProtectionPolicyRule' -Reason $_.Exception.Message }
+        } catch { Add-LogEntry -Section 'EOPProtectionPolicyRule' -ErrorRecord $_ }
         try {
-            $atpPreset = @(Get-ATPProtectionPolicyRule)
-            $presetRows += @($atpPreset | ForEach-Object {
+            $presetRows += @($atpPresetRules | ForEach-Object {
                 [PSCustomObject]@{
                     Name = $_.Name
                     State = $_.State
@@ -1458,37 +1855,37 @@ function Get-ThreatProtectionSection {
                     RecipientDomainIs = $_.RecipientDomainIs
                 }
             })
-        } catch { Add-LogEntry -Section 'ATPProtectionPolicyRule' -Reason $_.Exception.Message }
+        } catch { Add-LogEntry -Section 'ATPProtectionPolicyRule' -ErrorRecord $_ }
         Out-Table -CsvName "PresetSecurityPolicies" -Rows $presetRows -Columns @('Name','State','Priority','Type','SentTo','SentToMemberOf','RecipientDomainIs')
 
         Add-Line "### Built-in protection rule"
         Add-Line
-        $builtin = @()
-        try { $builtin = @(Get-ATPBuiltInProtectionRule) } catch { Add-LogEntry -Section 'ATPBuiltInProtectionRule' -Reason $_.Exception.Message }
-        $biRows = @($builtin | ForEach-Object {
+        $biRows = @($builtInRules | ForEach-Object {
             [PSCustomObject]@{ Name = $_.Name; State = $_.State; SentTo = $_.SentTo; SentToMemberOf = $_.SentToMemberOf; RecipientDomainIs = $_.RecipientDomainIs }
         })
         Out-Table -CsvName "BuiltInProtectionRule" -Rows $biRows -Columns @('Name','State','SentTo','SentToMemberOf','RecipientDomainIs')
 
         Add-Line "### Tenant Allow/Block List"
         Add-Line
-        $tabl = @()
-        foreach ($listType in @('Sender','Url','FileHash','IP')) {
-            try { $tabl += @(Get-TenantAllowBlockListItems -ListType $listType -ErrorAction Stop) }
-            catch { Add-LogEntry -Section "TenantAllowBlockListItems ($listType)" -Reason $_.Exception.Message }
-        }
-        $tablRows = @($tabl | ForEach-Object {
-            [PSCustomObject]@{
-                ListType = $_.ListType
-                Value = $_.Value
-                Action = $_.Action
-                ExpirationDate = $_.ExpirationDate
-                Notes = $_.Notes
+        $tablLists = [ordered]@{ 'Sender' = 'Domains & addresses'; 'Url' = 'URLs'; 'FileHash' = 'Files'; 'IP' = 'IP addresses' }
+        $tablRows = @()
+        foreach ($listType in $tablLists.Keys) {
+            try {
+                $tablRows += @(Get-TenantAllowBlockListItems -ListType $listType -ErrorAction Stop | ForEach-Object {
+                    [PSCustomObject]@{
+                        List = $tablLists[$listType]
+                        Value = $_.Value
+                        Action = $_.Action
+                        ExpirationDate = $(if ($_.ExpirationDate) { $_.ExpirationDate } else { 'Never expire' })
+                        Notes = $_.Notes
+                    }
+                })
             }
-        })
-        Out-Table -CsvName "TenantAllowBlockList" -Rows $tablRows -Columns @('ListType','Value','Action','ExpirationDate','Notes')
+            catch { Add-LogEntry -Section "TenantAllowBlockListItems ($listType)" -ErrorRecord $_ }
+        }
+        Out-Table -CsvName "TenantAllowBlockList" -Rows $tablRows -Columns @('List','Value','Action','ExpirationDate','Notes')
         $spoof = @()
-        try { $spoof = @(Get-TenantAllowBlockListSpoofItems) } catch { Add-LogEntry -Section 'TenantAllowBlockListSpoofItems' -Reason $_.Exception.Message }
+        try { $spoof = @(Get-TenantAllowBlockListSpoofItems) } catch { Add-LogEntry -Section 'TenantAllowBlockListSpoofItems' -ErrorRecord $_ }
         $spoofRows = @($spoof | ForEach-Object {
             [PSCustomObject]@{ SpoofedUser = $_.SpoofedUser; SendingInfrastructure = $_.SendingInfrastructure; Action = $_.Action; SpoofType = $_.SpoofType }
         })
@@ -1497,43 +1894,52 @@ function Get-ThreatProtectionSection {
         Add-Line "### Advanced delivery (SecOps mailboxes and phishing simulations)"
         Add-Line
         $secOps = @()
-        try { $secOps = @(Get-SecOpsOverridePolicy) } catch { Add-LogEntry -Section 'SecOpsOverridePolicy' -Reason $_.Exception.Message }
-        $secOpsRules = @()
-        try { $secOpsRules = @(Get-ExoSecOpsOverrideRule) } catch { }
+        try { $secOps = @(Get-SecOpsOverridePolicy) } catch { Add-LogEntry -Section 'SecOpsOverridePolicy' -ErrorRecord $_ }
+        $secOpsRules = @(); $secOpsRulesFailed = $false
+        try { $secOpsRules = @(Get-ExoSecOpsOverrideRule) } catch { $secOpsRulesFailed = $true; Add-LogEntry -Section 'ExoSecOpsOverrideRule' -ErrorRecord $_ }
         $secOpsRows = @($secOps | ForEach-Object {
-            $r = @($secOpsRules | Where-Object { $_.Policy -eq $_.Identity }) | Select-Object -First 1
-            [PSCustomObject]@{ Name = $_.Name; SentTo = $r.SentTo; SentToMemberOf = $r.SentToMemberOf }
+            $pol = $_
+            $ids = @("$($pol.Identity)", "$($pol.Name)", "$($pol.Guid)", "$($pol.ExchangeObjectId)", "$($pol.Id)", "$($pol.DistinguishedName)") | Where-Object { $_ }
+            $r = @($secOpsRules | Where-Object { "$($_.Policy)" -in $ids }) | Select-Object -First 1
+            if (-not $r -and $secOps.Count -eq 1 -and $secOpsRules.Count -ge 1) { $r = $secOpsRules[0] }
+            [PSCustomObject]@{ Name = $pol.Name; SentTo = $(if ($secOpsRulesFailed) { 'Unknown (rule lookup failed)' } else { $r.SentTo }); SentToMemberOf = $r.SentToMemberOf }
         })
         Out-Table -CsvName "SecOpsOverridePolicy" -Rows $secOpsRows -Columns @('Name','SentTo','SentToMemberOf')
         $phishSim = @()
-        try { $phishSim = @(Get-PhishSimOverridePolicy) } catch { Add-LogEntry -Section 'PhishSimOverridePolicy' -Reason $_.Exception.Message }
-        $phishSimRules = @()
-        try { $phishSimRules = @(Get-ExoPhishSimOverrideRule) } catch { }
+        try { $phishSim = @(Get-PhishSimOverridePolicy) } catch { Add-LogEntry -Section 'PhishSimOverridePolicy' -ErrorRecord $_ }
+        $phishSimRules = @(); $phishSimRulesFailed = $false
+        try { $phishSimRules = @(Get-ExoPhishSimOverrideRule) } catch { $phishSimRulesFailed = $true; Add-LogEntry -Section 'ExoPhishSimOverrideRule' -ErrorRecord $_ }
         $simRows = @($phishSim | ForEach-Object {
-            $r = @($phishSimRules | Where-Object { $_.Policy -eq $_.Identity }) | Select-Object -First 1
-            [PSCustomObject]@{ Name = $_.Name; Domains = $r.Domains; SenderIpRanges = $r.SenderIpRanges }
+            $pol = $_
+            $ids = @("$($pol.Identity)", "$($pol.Name)", "$($pol.Guid)", "$($pol.ExchangeObjectId)", "$($pol.Id)", "$($pol.DistinguishedName)") | Where-Object { $_ }
+            $r = @($phishSimRules | Where-Object { "$($_.Policy)" -in $ids }) | Select-Object -First 1
+            if (-not $r -and $phishSim.Count -eq 1 -and $phishSimRules.Count -ge 1) { $r = $phishSimRules[0] }
+            [PSCustomObject]@{ Name = $pol.Name; Domains = $(if ($phishSimRulesFailed) { 'Unknown (rule lookup failed)' } else { $r.Domains }); SenderIpRanges = $r.SenderIpRanges }
         })
         Out-Table -CsvName "PhishSimOverridePolicy" -Rows $simRows -Columns @('Name','Domains','SenderIpRanges')
         $simUrls = @()
-        try { $simUrls = @(Get-TenantAllowBlockListItems -ListType Url -ListSubType AdvancedDelivery) } catch { Add-LogEntry -Section 'Simulation URLs' -Reason $_.Exception.Message }
+        try { $simUrls = @(Get-TenantAllowBlockListItems -ListType Url -ListSubType AdvancedDelivery) } catch { Add-LogEntry -Section 'Simulation URLs' -ErrorRecord $_ }
         $simUrlRows = @($simUrls | ForEach-Object {
-            [PSCustomObject]@{ Value = $_.Value; ExpirationDate = $_.ExpirationDate }
+            [PSCustomObject]@{ SimulationUrl = $_.Value }
         })
-        Out-Table -CsvName "SimulationUrls" -Rows $simUrlRows -Columns @('Value','ExpirationDate')
+        Out-Table -CsvName "SimulationUrls" -Rows $simUrlRows -Columns @('SimulationUrl')
 
         Add-Line "### Quarantine policies"
         Add-Line
         $qp = @()
-        try { $qp = @(Get-QuarantinePolicy) } catch { Add-LogEntry -Section 'QuarantinePolicy' -Reason $_.Exception.Message }
+        try { $qp = @(Get-QuarantinePolicy) } catch { Add-LogEntry -Section 'QuarantinePolicy' -ErrorRecord $_ }
         $qpRows = @($qp | ForEach-Object {
+            $qi = Get-QuarantinePermissionInfo -Policy $_
             [PSCustomObject]@{
                 Name = $_.Name
+                RecipientMessageAccess = $qi.Access
+                Permissions = $qi.Permissions
+                QuarantineNotification = $qi.Notifications
+                IncludeMessagesFromBlockedSenderAddress = $_.IncludeMessagesFromBlockedSenderAddress
                 EndUserQuarantinePermissionsValue = $_.EndUserQuarantinePermissionsValue
-                ESNEnabled = $_.ESNEnabled
-                QuarantineRetentionDays = $_.QuarantineRetentionDays
             }
         })
-        Out-Table -CsvName "QuarantinePolicies" -Rows $qpRows -Columns @('Name','EndUserQuarantinePermissionsValue','ESNEnabled','QuarantineRetentionDays')
+        Out-Table -CsvName "QuarantinePolicies" -Rows $qpRows -Columns @('Name','RecipientMessageAccess','Permissions','QuarantineNotification','IncludeMessagesFromBlockedSenderAddress','EndUserQuarantinePermissionsValue')
         $qgs = @()
         try { $qgs = @(Get-QuarantinePolicy -QuarantinePolicyType GlobalQuarantinePolicy) } catch { }
         $qgRows = @($qgs | ForEach-Object {
@@ -1544,13 +1950,13 @@ function Get-ThreatProtectionSection {
         Add-Line "### Priority account protection and reporting"
         Add-Line
         $ets = @()
-        try { $ets = @(Get-EmailTenantSettings) } catch { Add-LogEntry -Section 'EmailTenantSettings' -Reason $_.Exception.Message }
+        try { $ets = @(Get-EmailTenantSettings) } catch { Add-LogEntry -Section 'EmailTenantSettings' -ErrorRecord $_ }
         $etsRows = @($ets | ForEach-Object {
             [PSCustomObject]@{ Identity = $_.Identity; EnablePriorityAccountProtection = $_.EnablePriorityAccountProtection }
         })
         Out-Table -CsvName "EmailTenantSettings" -Rows $etsRows -Columns @('Identity','EnablePriorityAccountProtection')
         $rsp = @()
-        try { $rsp = @(Get-ReportSubmissionPolicy) } catch { Add-LogEntry -Section 'ReportSubmissionPolicy' -Reason $_.Exception.Message }
+        try { $rsp = @(Get-ReportSubmissionPolicy) } catch { Add-LogEntry -Section 'ReportSubmissionPolicy' -ErrorRecord $_ }
         $rspRows = @($rsp | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
@@ -1565,11 +1971,11 @@ function Get-ThreatProtectionSection {
         })
         Out-Table -CsvName "ReportSubmissionPolicy" -Rows $rspRows -Columns @('Name','EnableReportToMicrosoft','ReportChatMessageEnabled','ReportJunkToCustomizedAddress','ReportNotJunkToCustomizedAddress','ReportPhishToCustomizedAddress','ReportJunkAddresses','ReportPhishAddresses')
         $tpp = @()
-        try { $tpp = @(Get-TeamsProtectionPolicy) } catch { Add-LogEntry -Section 'TeamsProtectionPolicy' -Reason $_.Exception.Message }
+        try { $tpp = @(Get-TeamsProtectionPolicy) } catch { Add-LogEntry -Section 'TeamsProtectionPolicy' -ErrorRecord $_ }
         $tppRows = @($tpp | ForEach-Object {
-            [PSCustomObject]@{ Name = $_.Name; ZAPForTeamsEnabled = $_.ZAPForTeamsEnabled; ZapEnabled = $_.ZapEnabled }
+            [PSCustomObject]@{ Name = $_.Name; ZapEnabled = $_.ZapEnabled; HighConfidencePhishQuarantineTag = $_.HighConfidencePhishQuarantineTag; MalwareQuarantineTag = $_.MalwareQuarantineTag }
         })
-        Out-Table -CsvName "TeamsProtectionPolicy" -Rows $tppRows -Columns @('Name','ZAPForTeamsEnabled','ZapEnabled')
+        Out-Table -CsvName "TeamsProtectionPolicy" -Rows $tppRows -Columns @('Name','ZapEnabled','HighConfidencePhishQuarantineTag','MalwareQuarantineTag')
     }
 }
 
@@ -1581,15 +1987,16 @@ function Get-AlertPoliciesSection {
         $rows = @($alerts | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
+                Type = $(if (Test-IsTrue $_.IsSystemRule) { 'System' } else { 'Custom' })
+                Status = $(if (Test-IsTrue $_.Disabled) { 'Off' } else { 'On' })
                 Category = $_.Category
                 Severity = $_.Severity
-                Disabled = $_.Disabled
-                IsSystemRule = $_.IsSystemRule
                 NotifyUser = $_.NotifyUser
                 ThreatType = $_.ThreatType
+                ManagedIn = $(if ($_.Category -eq 'DataLossPrevention') { 'Purview DLP policy' } else { 'Defender portal (Alert policy)' })
             }
         })
-        Out-Table -CsvName "ProtectionAlerts" -Rows $rows -Columns @('Name','Category','Severity','Disabled','IsSystemRule','NotifyUser','ThreatType')
+        Out-Table -CsvName "ProtectionAlerts" -Rows $rows -Columns @('Name','Type','Status','Category','Severity','NotifyUser','ThreatType','ManagedIn')
         $script:Summary['Alert policies'] = $alerts.Count
     }
 }
@@ -1599,33 +2006,33 @@ function Get-ComplianceSection {
         Add-Line "### MRM retention policies and tags"
         Add-Line
         $rp = @()
-        try { $rp = @(Get-RetentionPolicy) } catch { Add-LogEntry -Section 'RetentionPolicy' -Reason $_.Exception.Message }
+        try { $rp = @(Get-RetentionPolicy) } catch { Add-LogEntry -Section 'RetentionPolicy' -ErrorRecord $_ }
         $rpRows = @($rp | ForEach-Object {
             [PSCustomObject]@{
-                Name = $_.Name
-                RetentionPolicyTagLinks = @($_.RetentionPolicyTagLinks | ForEach-Object { $_.Name }) -join '; '
+                Name = $(if ($_.Name -eq 'ArbitrationMailbox') { 'ArbitrationMailbox (system policy, hidden in the portal)' } else { $_.Name })
+                RetentionPolicyTagLinks = @($_.RetentionPolicyTagLinks | ForEach-Object { if ($_ -is [string]) { $_ } elseif ($_.Name) { "$($_.Name)" } else { "$_" } } | Sort-Object) -join '; '
                 IsDefault = $_.IsDefault
             }
         })
         Out-Table -CsvName "RetentionPolicies" -Rows $rpRows -Columns @('Name','RetentionPolicyTagLinks','IsDefault')
         $tags = @()
-        try { $tags = @(Get-RetentionPolicyTag) } catch { Add-LogEntry -Section 'RetentionPolicyTag' -Reason $_.Exception.Message }
-        $tagRows = @($tags | ForEach-Object {
+        try { $tags = @(Get-RetentionPolicyTag) } catch { Add-LogEntry -Section 'RetentionPolicyTag' -ErrorRecord $_ }
+        $tagRows = @($tags | Where-Object { -not $_.SystemTag } | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
                 Type = $_.Type
+                RetentionPeriod = Format-RetentionPeriod -Tag $_
                 RetentionAction = $_.RetentionAction
-                AgeLimitForRetention = $_.AgeLimitForRetention
                 RetentionEnabled = $_.RetentionEnabled
-                IsDefaultModeratedRecoveryPolicyTag = $_.IsDefaultModeratedRecoveryPolicyTag
+                AgeLimitForRetention = $_.AgeLimitForRetention
             }
-        })
-        Out-Table -CsvName "RetentionPolicyTags" -Rows $tagRows -Columns @('Name','Type','RetentionAction','AgeLimitForRetention','RetentionEnabled','IsDefaultModeratedRecoveryPolicyTag')
+        } | Sort-Object Type, Name)
+        Out-Table -CsvName "RetentionPolicyTags" -Rows $tagRows -Columns @('Name','Type','RetentionPeriod','RetentionAction','RetentionEnabled','AgeLimitForRetention')
 
         Add-Line "### IRM and OME configuration"
         Add-Line
         $irm = @()
-        try { $irm = @(Get-IRMConfiguration) } catch { Add-LogEntry -Section 'IRMConfiguration' -Reason $_.Exception.Message }
+        try { $irm = @(Get-IRMConfiguration) } catch { Add-LogEntry -Section 'IRMConfiguration' -ErrorRecord $_ }
         $irmRows = @($irm | ForEach-Object {
             [PSCustomObject]@{
                 Identity = $_.Identity
@@ -1639,7 +2046,7 @@ function Get-ComplianceSection {
         })
         Out-Table -CsvName "IrmConfiguration" -Rows $irmRows -Columns @('Identity','InternalLicensingEnabled','ExternalLicensingEnabled','AzureRMSLicensingEnabled','TransportDecryptionSetting','JournalReportDecryptionEnabled','SearchEnabled')
         $ome = @()
-        try { $ome = @(Get-OMEConfiguration) } catch { Add-LogEntry -Section 'OMEConfiguration' -Reason $_.Exception.Message }
+        try { $ome = @(Get-OMEConfiguration) } catch { Add-LogEntry -Section 'OMEConfiguration' -ErrorRecord $_ }
         $omeRows = @($ome | ForEach-Object {
             [PSCustomObject]@{
                 Identity = $_.Identity
@@ -1655,20 +2062,33 @@ function Get-ComplianceSection {
         if (Add-PurviewStatusOrThrow -Section 'Purview retention') { return }
         Assert-Cmdlet Get-RetentionCompliancePolicy
         $policies = @(Get-RetentionCompliancePolicy -DistributionDetail)
+        $tagNames = @{}
+        try {
+            foreach ($t in @(Get-ComplianceTag)) {
+                foreach ($k in @("$($t.Guid)", "$($t.ImmutableId)", "$($t.Identity)", "$($t.Name)")) {
+                    if ($k -and -not $tagNames.ContainsKey($k)) { $tagNames[$k] = "$($t.Name)" }
+                }
+            }
+        }
+        catch { Add-LogEntry -Section 'ComplianceTag (name map)' -ErrorRecord $_ }
         $exo = @($policies | Where-Object {
             @($_.ExchangeLocation).Count -gt 0 -and "$($_.ExchangeLocation)" -notmatch '^\s*$'
         })
         $rows = @($exo | ForEach-Object {
+            $pn = $_.Name
+            $rules = @()
+            try { $rules = @(@(Get-RetentionComplianceRule -Policy $pn) | ForEach-Object { Format-RetentionRule -Rule $_ -TagNames $tagNames } | Sort-Object -Unique) }
+            catch { Add-LogEntry -Section "RetentionComplianceRule ($pn)" -ErrorRecord $_; $rules = @('Unknown (rule lookup failed)') }
             [PSCustomObject]@{
-                Name = $_.Name
+                Name = $pn
                 Mode = $_.Mode
                 Enabled = $_.Enabled
                 ExchangeLocation = $_.ExchangeLocation
                 ExchangeLocationException = $_.ExchangeLocationException
-                Rules = @(@(Get-RetentionComplianceRule -Policy $_.Name -ErrorAction SilentlyContinue) | ForEach-Object { $_.Name }) -join '; '
+                RetentionSettings = $rules -join '; '
             }
         })
-        Out-Table -CsvName "PurviewRetentionPolicies" -Rows $rows -Columns @('Name','Mode','Enabled','ExchangeLocation','ExchangeLocationException','Rules')
+        Out-Table -CsvName "PurviewRetentionPolicies" -Rows $rows -Columns @('Name','Mode','Enabled','ExchangeLocation','ExchangeLocationException','RetentionSettings')
         $script:Summary['Purview retention policies (Exchange)'] = $exo.Count
     }
 
@@ -1678,14 +2098,15 @@ function Get-ComplianceSection {
         $policies = @(Get-DlpCompliancePolicy)
         $exo = @($policies | Where-Object { @($_.ExchangeLocation).Count -gt 0 })
         $rows = @($exo | ForEach-Object {
-            $rules = @()
-            try { $rules = @(Get-DlpComplianceRule -Policy $_.Name -ErrorAction Stop) } catch { }
+            $pn = $_.Name
+            $rules = @(); $rulesFailed = $false
+            try { $rules = @(Get-DlpComplianceRule -Policy $pn) } catch { $rulesFailed = $true; Add-LogEntry -Section "DlpComplianceRule ($pn)" -ErrorRecord $_ }
             [PSCustomObject]@{
-                Name = $_.Name
+                Name = $pn
                 Mode = $_.Mode
                 Enabled = $_.Enabled
                 ExchangeLocation = $_.ExchangeLocation
-                Rules = @($rules | ForEach-Object { $_.Name }) -join '; '
+                Rules = $(if ($rulesFailed) { 'Unknown (rule lookup failed)' } else { @($rules | ForEach-Object { $_.Name }) -join '; ' })
             }
         })
         Out-Table -CsvName "DlpPolicies" -Rows $rows -Columns @('Name','Mode','Enabled','ExchangeLocation','Rules')
@@ -1696,30 +2117,39 @@ function Get-ComplianceSection {
         if (Add-PurviewStatusOrThrow -Section 'Sensitivity labels') { return }
         Assert-Cmdlet Get-Label
         $labels = @(Get-Label)
-        $labelRows = @($labels | ForEach-Object {
+        $labelRows = @($labels | Sort-Object Priority | ForEach-Object {
+            $li = Get-SensitivityLabelInfo -Label $_ -AllLabels $labels
             [PSCustomObject]@{
-                Name = $_.Name
                 DisplayName = $_.DisplayName
-                ContentType = $_.ContentType
-                Disabled = $_.Disabled
+                Name = $_.Name
                 Priority = $_.Priority
-                Tooltip = $_.Tooltip
+                ParentLabel = $li.Parent
+                Scope = $li.Scope
+                DescriptionForUsers = $_.Tooltip
+                AccessControl = $li.AccessControl
+                ContentMarking = $li.ContentMarking
+                AutoLabeling = $li.AutoLabeling
+                GroupSettings = $li.GroupSettings
+                SiteSettings = $li.SiteSettings
             }
         })
-        Out-Table -CsvName "SensitivityLabels" -Rows $labelRows -Columns @('Name','DisplayName','ContentType','Disabled','Priority','Tooltip')
+        Out-Table -CsvName "SensitivityLabels" -Rows $labelRows -Columns @('DisplayName','Name','Priority','ParentLabel','Scope','DescriptionForUsers','AccessControl','ContentMarking','AutoLabeling','GroupSettings','SiteSettings')
         $script:Summary['Sensitivity labels'] = $labels.Count
 
         $labelPolicies = @()
-        try { $labelPolicies = @(Get-LabelPolicy) } catch { Add-LogEntry -Section 'LabelPolicy' -Reason $_.Exception.Message }
+        try { $labelPolicies = @(Get-LabelPolicy) } catch { Add-LogEntry -Section 'LabelPolicy' -ErrorRecord $_ }
         $lpRows = @($labelPolicies | ForEach-Object {
             [PSCustomObject]@{
                 Name = $_.Name
-                Labels = @($_.Labels) -join '; '
-                ExchangeLocation = $_.ExchangeLocation
-                Enabled = $_.Enabled
+                Description = $_.Comment
+                PublishedLabels = @(Resolve-LabelNames -Ids @($_.Labels) -AllLabels $labels) -join '; '
+                PublishedTo = @(@($_.ExchangeLocation) + @($_.ModernGroupLocation) | Where-Object { "$_" -match '\S' }) -join '; '
+                ExcludedUsersAndGroups = @(@($_.ExchangeLocationException) + @($_.ModernGroupLocationException) | Where-Object { "$_" -match '\S' }) -join '; '
+                ModernGroupLocation = @($_.ModernGroupLocation) -join '; '
+                ModernGroupLocationException = @($_.ModernGroupLocationException) -join '; '
             }
         })
-        Out-Table -CsvName "LabelPolicies" -Rows $lpRows -Columns @('Name','Labels','ExchangeLocation','Enabled')
+        Out-Table -CsvName "LabelPolicies" -Rows $lpRows -Columns @('Name','Description','PublishedLabels','PublishedTo','ExcludedUsersAndGroups')
     }
 
     Invoke-Section -Title "Retention labels" -Level 3 -Body {
@@ -1869,16 +2299,26 @@ if ($AppId -and (-not $CertificateThumbprint -or -not $Organization)) {
     exit 1
 }
 
+if ($ExoLogPath -and -not (Test-Path -LiteralPath $ExoLogPath)) {
+    New-Item -ItemType Directory -Force -Path $ExoLogPath | Out-Null
+}
+
 try {
     Initialize-ExchangeOnlineModule
 
     Write-Host "`nConnecting to Exchange Online..." -ForegroundColor Cyan
+    $script:PreExistingConnectionIds = @(Get-ConnectionInformation -ErrorAction SilentlyContinue | ForEach-Object { $_.ConnectionId })
     $exoParams = @{ ShowBanner = $false; ErrorAction = 'Stop' }
     if ($UserPrincipalName) { $exoParams.UserPrincipalName = $UserPrincipalName }
     if ($AppId) {
         $exoParams.AppId = $AppId
         $exoParams.CertificateThumbprint = $CertificateThumbprint
         $exoParams.Organization = $Organization
+    }
+    if ($ExoLogPath) {
+        $exoParams.EnableErrorReporting = $true
+        $exoParams.LogDirectoryPath = $ExoLogPath
+        $exoParams.LogLevel = 'All'
     }
     try {
         Connect-ExchangeOnline @exoParams
@@ -1896,12 +2336,12 @@ try {
         $script:OrgConfig = Get-OrganizationConfig -ErrorAction Stop
         $script:TenantName = $script:OrgConfig.DisplayName
     }
-    catch { Add-LogEntry -Section 'OrganizationConfig (header)' -Reason $_.Exception.Message }
+    catch { Add-LogEntry -Section 'OrganizationConfig (header)' -ErrorRecord $_ }
     try {
         $script:AcceptedDomains = @(Get-AcceptedDomain -ErrorAction Stop)
         $script:InitialDomain = @($script:AcceptedDomains | Where-Object { $_.InitialDomain } | Select-Object -First 1).DomainName
     }
-    catch { Add-LogEntry -Section 'AcceptedDomain (header)' -Reason $_.Exception.Message }
+    catch { Add-LogEntry -Section 'AcceptedDomain (header)' -ErrorRecord $_ }
 
     # Collected-by identity
     try {
@@ -1925,13 +2365,18 @@ try {
             $ippsParams.CertificateThumbprint = $CertificateThumbprint
             $ippsParams.Organization = $Organization
         }
+        if ($ExoLogPath) {
+            $ippsParams.EnableErrorReporting = $true
+            $ippsParams.LogDirectoryPath = $ExoLogPath
+            $ippsParams.LogLevel = 'All'
+        }
         try {
             Connect-IPPSSession @ippsParams
             $script:PurviewConnected = $true
             Write-Host "Connected to Security & Compliance." -ForegroundColor Green
         }
         catch {
-            $script:PurviewError = $_.Exception.Message
+            $script:PurviewError = Get-ErrorDetail $_
             Write-Warning "Could not connect to Security & Compliance PowerShell - $script:PurviewError. Purview sections will be marked Not available."
             Add-LogEntry -Section 'Purview connection' -Reason $script:PurviewError
         }
@@ -1946,7 +2391,7 @@ try {
                 Write-Host "Connected to Microsoft Graph." -ForegroundColor Green
             }
             catch {
-                $script:GraphError = $_.Exception.Message
+                $script:GraphError = Get-ErrorDetail $_
                 Write-Warning "Could not connect to Microsoft Graph - $script:GraphError."
                 Add-LogEntry -Section 'Graph connection' -Reason $script:GraphError
             }
@@ -1957,6 +2402,8 @@ try {
             Add-LogEntry -Section 'Graph connection' -Reason $script:GraphError
         }
     }
+
+    Register-ExoProxyWrapper
 
     # Header (section 0)
     $purviewState = if (-not $IncludePurview) { 'No' } elseif ($script:PurviewConnected) { 'Yes' } else { "Failed ($script:PurviewError)" }
@@ -2030,7 +2477,7 @@ try {
         New-Item -ItemType Directory -Force -Path $csvDir | Out-Null
         foreach ($key in $script:CsvData.Keys) {
             $csvPath = Join-Path $csvDir "$key.csv"
-            $script:CsvData[$key] | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+            @(ConvertTo-CsvRow -Rows $script:CsvData[$key]) | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
         }
         Write-Host "CSV exports written to: $csvDir" -ForegroundColor Green
     }
@@ -2039,8 +2486,17 @@ catch {
     Write-Error "An error occurred: $_"
 }
 finally {
-    Write-Host "`nDisconnecting from Exchange Online..." -ForegroundColor Cyan
-    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "`nDisconnecting sessions opened by this script..." -ForegroundColor Cyan
+    $current = @(Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object { $_.ConnectionId })
+    $ours = @($current | Where-Object { $script:PreExistingConnectionIds -notcontains $_.ConnectionId })
+    if ($ours.Count -gt 0) {
+        foreach ($c in $ours) {
+            Disconnect-ExchangeOnline -ConnectionId $c.ConnectionId -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
+    elseif ($current.Count -eq 0 -and $script:PreExistingConnectionIds.Count -eq 0) {
+        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+    }
     if ($script:GraphConnected) { Disconnect-MgGraph -ErrorAction SilentlyContinue }
     Write-Host "Done." -ForegroundColor Green
 }
