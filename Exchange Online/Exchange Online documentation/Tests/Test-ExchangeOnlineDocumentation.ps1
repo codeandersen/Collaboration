@@ -18,6 +18,24 @@ $funcs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.
 "Extracted $($funcs.Count) functions"
 . ([scriptblock]::Create(($funcs | ForEach-Object { $_.Extent.Text }) -join "`n`n"))
 
+# ---- Static parameter-name check (computed now, asserted after Check is defined)
+$paramViolations = @()
+$paramCmdCache = @{}
+foreach ($ca in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+    $cn = $ca.GetCommandName()
+    if (-not $cn) { continue }
+    if (-not $paramCmdCache.ContainsKey($cn)) { $paramCmdCache[$cn] = Get-Command $cn -ErrorAction SilentlyContinue }
+    $info = $paramCmdCache[$cn]
+    if (-not $info -or $info.CommandType -ne 'Cmdlet') { continue }
+    $validNames = @($info.Parameters.Keys) + @($info.Parameters.Values | ForEach-Object { $_.Aliases })
+    foreach ($pa in @($ca.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] })) {
+        $pn = $pa.ParameterName
+        if (@($validNames | Where-Object { $_ -eq $pn }).Count -eq 0 -and @($validNames | Where-Object { $_ -like "$pn*" }).Count -ne 1) {
+            $paramViolations += "line $($ca.Extent.StartLineNumber): $cn -$pn"
+        }
+    }
+}
+
 # ---- Script state the functions expect ----------------------------------
 $script:ScriptVersion = '1.0-harness'
 $script:RunStart = Get-Date
@@ -34,7 +52,12 @@ $script:TenantName = 'Mock Corp'
 $script:InitialDomain = 'mockcorp.onmicrosoft.com'
 $script:CollectedBy = 'admin@mockcorp.onmicrosoft.com'
 $script:ExoModuleVersion = '3.10.1'
-$script:AcceptedDomains = $null
+$script:AcceptedDomains = @(
+    [PSCustomObject]@{ DomainName = 'mockcorp.com'; DomainType = 'Authoritative'; Default = $true; InitialDomain = $false },
+    [PSCustomObject]@{ DomainName = 'mockcorp.onmicrosoft.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $true },
+    [PSCustomObject]@{ DomainName = 'nodkim.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $false },
+    [PSCustomObject]@{ DomainName = 'multispf.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $false }
+)
 $script:DkimConfig = $null
 $script:DistGroups = $null
 $script:DynGroups = $null
@@ -42,7 +65,11 @@ $script:M365Groups = $null
 $script:InboundConnectors = $null
 $script:OutboundConnectors = $null
 $script:TransportRules = $null
-$script:OrgConfig = [PSCustomObject]@{ DisplayName = 'Mock Corp'; OrganizationId = '11111111-2222-3333-4444-555555555555'; OAuth2ClientProfileEnabled = $true; AuditDisabled = $false; CustomerLockBoxEnabled = $false; MailTipsAllTipsEnabled = $true; MailTipsExternalRecipientsTipsEnabled = $true; MailTipsLargeAudienceThreshold = 25; EwsEnabled = $null; EwsAllowList = $null; FocusedInboxOn = $true; DefaultAuthenticationPolicy = $null; ActivityBasedAuthenticationTimeoutEnabled = $false; SendFromAliasEnabled = $true; AutoExpandingArchiveEnabled = $false; PublicFoldersEnabled = 'Local'; RootPublicFolderMailbox = 'PFMBX1' }
+$script:LookupFailedText = 'Unknown (lookup failed)'
+$script:MailboxesError = $null; $script:CasMailboxesError = $null; $script:DistGroupsError = $null
+$script:DynGroupsError = $null; $script:M365GroupsError = $null; $script:InboundConnectorsError = $null
+$script:OutboundConnectorsError = $null; $script:TransportRulesError = $null; $script:TransportConfigError = $null
+$script:OrgConfig = [PSCustomObject]@{ DisplayName = 'Mock Corp'; OrganizationId = '11111111-2222-3333-4444-555555555555'; OAuth2ClientProfileEnabled = $true; AuditDisabled = $false; CustomerLockBoxEnabled = $false; MailTipsAllTipsEnabled = $true; MailTipsExternalRecipientsTipsEnabled = $true; MailTipsLargeAudienceThreshold = 25; EwsEnabled = $null; EwsAllowList = $null; EwsApplicationAccessPolicy = 'EnforceAllowList'; EwsBlockList = @('BadApp1','BadApp2'); FocusedInboxOn = $true; DefaultAuthenticationPolicy = $null; ActivityBasedAuthenticationTimeoutEnabled = $false; SendFromAliasEnabled = $true; AutoExpandingArchiveEnabled = $false; PublicFoldersEnabled = 'Local'; RootPublicFolderMailbox = 'PFMBX1' }
 
 # Params the functions read
 $script:CustomerName = 'MockCorp'
@@ -54,6 +81,9 @@ $script:AppId = $null
 $script:CertificateThumbprint = $null
 $script:Organization = $null
 $script:IncludePurview = $true
+$script:IncludeIntegratedApps = $false
+$script:IntegratedAppsConnected = $false
+$script:IntegratedAppsError = $null
 $script:MaxListItems = 10
 $script:MaxTableRows = 25
 $script:CsvDelimiter = $null
@@ -62,6 +92,9 @@ $script:ExoLogPath = $null
 
 # ---- DNS stubs (DnsClient module not faked) ------------------------------
 function Resolve-DnsSafe { param([string]$Name, [string]$Type)
+    if ($Type -eq 'MX' -and $Name -eq 'nodkim.com') {
+        return @([PSCustomObject]@{ NameExchange = "contoso-com.o-v1.mx.microsoft"; Section = 'Answer'; Type = 'MX' })
+    }
     if ($Type -eq 'MX' -and $Name -notlike '*.onmicrosoft.com') {
         return @([PSCustomObject]@{ NameExchange = "mockcorp-com.mail.protection.outlook.com"; Section = 'Answer'; Type = 'MX' })
     }
@@ -71,9 +104,17 @@ function Resolve-DnsSafe { param([string]$Name, [string]$Type)
     if ($Type -eq 'CNAME' -and $Name -eq 'selector2._domainkey.mockcorp.com') {
         return @([PSCustomObject]@{ NameHost = 'selector2-mockcorp-com._domainkey.mockcorp.onmicrosoft.com' })
     }
+    if ($Type -eq 'CNAME' -and $Name -eq 'selector1._domainkey.nodkim.com') {
+        return @([PSCustomObject]@{ NameHost = 'selector1-nodkim-com._domainkey.nodkim.onmicrosoft.com.' })
+    }
+    if ($Type -eq 'CNAME' -and $Name -eq 'selector2._domainkey.nodkim.com') {
+        return @([PSCustomObject]@{ NameHost = 'selector2-nodkim-com._domainkey.nodkim.onmicrosoft.com.' })
+    }
     return @()
 }
 function Get-TxtRecords { param([string]$Name)
+    if ($Name -eq '_dmarc.multispf.com') { return @('v=DMARC1; p=none', 'v=DMARC1; p=reject') }
+    if ($Name -eq 'multispf.com') { return @('v=spf1 include:a.example.com -all', 'v=spf1 include:b.example.com -all') }
     if ($Name -like '_dmarc.*') { return @('v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@mockcorp.com') }
     if ($Name -like '_mta-sts.*') { return @() }
     if ($Name -like '_smtp._tls.*') { return @() }
@@ -85,7 +126,9 @@ function Get-OrganizationConfig { @($script:OrgConfig) }
 function Get-AcceptedDomain {
     @(
         [PSCustomObject]@{ DomainName = 'mockcorp.com'; DomainType = 'Authoritative'; Default = $true; InitialDomain = $false },
-        [PSCustomObject]@{ DomainName = 'mockcorp.onmicrosoft.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $true }
+        [PSCustomObject]@{ DomainName = 'mockcorp.onmicrosoft.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $true },
+        [PSCustomObject]@{ DomainName = 'nodkim.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $false },
+        [PSCustomObject]@{ DomainName = 'multispf.com'; DomainType = 'Authoritative'; Default = $false; InitialDomain = $false }
     )
 }
 function Get-DkimSigningConfig {
@@ -101,7 +144,8 @@ function Get-ExternalInOutlook { @([PSCustomObject]@{ Identity = 'bf01e4ea-0499-
 function Get-InboundConnector {
     @(
         [PSCustomObject]@{ Name = 'Inbound from partner'; ConnectorType = 'Partner'; Enabled = $true; SenderDomains = @('partner.com'); SenderIPAddresses = @('10.0.0.1'); RequireTls = $true; TlsSenderCertificateName = '*.partner.com'; RestrictDomainsToIPAddresses = $false; RestrictDomainsToCertificate = $true; CloudServicesMailEnabled = $false; TreatMessagesAsInternal = $false; EFSkipLastIP = $false; EFSkipIPs = @(); EFUsers = @(); EFTestMode = $false },
-        [PSCustomObject]@{ Name = 'Inbound from on-prem'; ConnectorType = 'OnPremises'; Enabled = $true; SenderDomains = @('*'); SenderIPAddresses = @('192.168.1.1'); RequireTls = $true; TlsSenderCertificateName = 'mail.mockcorp.com'; RestrictDomainsToIPAddresses = $true; RestrictDomainsToCertificate = $false; CloudServicesMailEnabled = $false; TreatMessagesAsInternal = $true; EFSkipLastIP = $true; EFSkipIPs = @('192.168.1.1'); EFUsers = @(); EFTestMode = $false }
+        [PSCustomObject]@{ Name = 'Inbound from on-prem'; ConnectorType = 'OnPremises'; Enabled = $true; SenderDomains = @('*'); SenderIPAddresses = @('192.168.1.1'); RequireTls = $true; TlsSenderCertificateName = 'mail.mockcorp.com'; RestrictDomainsToIPAddresses = $true; RestrictDomainsToCertificate = $false; CloudServicesMailEnabled = $false; TreatMessagesAsInternal = $true; EFSkipLastIP = $true; EFSkipIPs = @('192.168.1.1'); EFUsers = @(); EFTestMode = $false },
+        [PSCustomObject]@{ Name = 'Inbound no EF'; ConnectorType = 'Partner'; Enabled = $true; SenderDomains = @('partner.com'); SenderIPAddresses = @('10.0.0.2'); RequireTls = $false; TlsSenderCertificateName = $null; RestrictDomainsToIPAddresses = $false; RestrictDomainsToCertificate = $false; CloudServicesMailEnabled = $false; TreatMessagesAsInternal = $false; EFSkipLastIP = $false; EFSkipIPs = $null; EFUsers = @(); EFTestMode = $false }
     )
 }
 function Get-OutboundConnector {
@@ -131,13 +175,14 @@ function Get-EXOMailbox { param($ResultSize, $Properties, [switch]$InactiveMailb
     }
     $mk += [PSCustomObject]@{ DisplayName = 'Shared Info'; UserPrincipalName = 'info@mockcorp.com'; PrimarySmtpAddress = 'info@mockcorp.com'; RecipientTypeDetails = 'SharedMailbox'; LitigationHoldEnabled = $false; ArchiveStatus = 'None'; AutoExpandingArchiveEnabled = $false; RetentionHoldEnabled = $false; AuditEnabled = $true; ForwardingSmtpAddress = 'smtp:fwd@partner.com'; ForwardingAddress = $null; DeliverToMailboxAndForward = $true; RoleAssignmentPolicy = 'Default Role Assignment Policy'; RetentionPolicy = $null; WhenMailboxCreated = (Get-Date '2019-01-01'); IsInactiveMailbox = $false; ProhibitSendReceiveQuota = '50 GB' }
     $mk += [PSCustomObject]@{ DisplayName = 'Room A'; UserPrincipalName = 'rooma@mockcorp.com'; PrimarySmtpAddress = 'rooma@mockcorp.com'; RecipientTypeDetails = 'RoomMailbox'; LitigationHoldEnabled = $false; ArchiveStatus = 'None'; AutoExpandingArchiveEnabled = $false; RetentionHoldEnabled = $false; AuditEnabled = $false; ForwardingSmtpAddress = $null; ForwardingAddress = $null; DeliverToMailboxAndForward = $false; RoleAssignmentPolicy = 'Default Role Assignment Policy'; RetentionPolicy = 'Default MRM Policy'; WhenMailboxCreated = (Get-Date '2019-01-01'); IsInactiveMailbox = $false; ProhibitSendReceiveQuota = '50 GB' }
+    $mk += [PSCustomObject]@{ DisplayName = 'No Audit'; UserPrincipalName = 'noaudit@mockcorp.com'; PrimarySmtpAddress = 'noaudit@mockcorp.com'; RecipientTypeDetails = 'UserMailbox'; LitigationHoldEnabled = $false; ArchiveStatus = 'None'; AutoExpandingArchiveEnabled = $false; RetentionHoldEnabled = $false; AuditEnabled = $null; ForwardingSmtpAddress = $null; ForwardingAddress = $null; DeliverToMailboxAndForward = $false; RoleAssignmentPolicy = 'Default Role Assignment Policy'; RetentionPolicy = 'Default MRM Policy'; WhenMailboxCreated = (Get-Date '2021-01-01'); IsInactiveMailbox = $false; ProhibitSendReceiveQuota = '50 GB' }
     @($mk)
 }
 function Get-EXOCASMailbox { param($ResultSize, $Properties)
     @(
         [PSCustomObject]@{ DisplayName = 'User 1'; PopEnabled = $false; ImapEnabled = $false; EwsEnabled = $true; ActiveSyncEnabled = $true; MapiEnabled = $true; OWAEnabled = $true; SmtpClientAuthenticationDisabled = $true; OwaMailboxPolicy = 'OwaMailboxPolicy-Default'; ActiveSyncMailboxPolicy = 'Default' },
         [PSCustomObject]@{ DisplayName = 'User 2'; PopEnabled = $true; ImapEnabled = $false; EwsEnabled = $true; ActiveSyncEnabled = $true; MapiEnabled = $true; OWAEnabled = $true; SmtpClientAuthenticationDisabled = $true; OwaMailboxPolicy = 'OwaMailboxPolicy-Default'; ActiveSyncMailboxPolicy = 'Default' },
-        [PSCustomObject]@{ DisplayName = 'User 3'; PopEnabled = $false; ImapEnabled = $false; EwsEnabled = $true; ActiveSyncEnabled = $true; MapiEnabled = $true; OWAEnabled = $true; SmtpClientAuthenticationDisabled = $null; OwaMailboxPolicy = 'OwaMailboxPolicy-Default'; ActiveSyncMailboxPolicy = $null }
+        [PSCustomObject]@{ DisplayName = 'User 3'; PopEnabled = $null; ImapEnabled = $false; EwsEnabled = $true; ActiveSyncEnabled = $true; MapiEnabled = $true; OWAEnabled = $true; SmtpClientAuthenticationDisabled = $null; OwaMailboxPolicy = 'OwaMailboxPolicy-Default'; ActiveSyncMailboxPolicy = $null }
     )
 }
 function Get-DistributionGroup { param($ResultSize)
@@ -171,11 +216,26 @@ function Get-MigrationEndpoint { @() }
 function Get-MigrationBatch { @() }
 
 # EOP / Defender fakes
-function Get-EOPProtectionPolicyRule { @([PSCustomObject]@{ Name = 'Standard Preset Security Policy'; State = 'Enabled'; Priority = 0; SentTo = @(); SentToMemberOf = @('sg@mockcorp.com'); RecipientDomainIs = @(); HostedContentFilterPolicy = 'Standard Preset Security Policy' }) }
+function Get-EOPProtectionPolicyRule { @([PSCustomObject]@{ Name = 'Standard Preset Security Policy'; State = 'Enabled'; Priority = 0; SentTo = @(); SentToMemberOf = @('sg@mockcorp.com'); RecipientDomainIs = @(); HostedContentFilterPolicy = 'Standard Preset Security Policy'; AntiPhishPolicy = 'Standard Preset Security Policy' }) }
 function Get-ATPProtectionPolicyRule { @([PSCustomObject]@{ Name = 'Strict Preset Security Policy'; State = 'Disabled'; Priority = 1; SentTo = @(); SentToMemberOf = @(); RecipientDomainIs = @() }) }
 function Get-ATPBuiltInProtectionRule { @([PSCustomObject]@{ Name = 'ATP Built-In Protection Rule'; State = 'Enabled'; SentTo = @(); SentToMemberOf = @(); RecipientDomainIs = @(); SafeLinksPolicy = 'Built-In Protection Policy'; ExceptIfRecipientDomainIs = @('excluded.example.com') }) }
-function Get-AntiPhishPolicy { @([PSCustomObject]@{ Name = 'Office365 AntiPhish Default'; Enabled = $true; EnableTargetedUserProtection = $false; TargetedUsersToProtect = @(); EnableTargetedDomainsProtection = $false; TargetedDomainsToProtect = @(); ExcludedSenders = @(); ExcludedDomains = @(); TargetedUserProtectionAction = 'NoAction'; TargetedUserQuarantineTag = 'AdminOnlyAccessPolicy'; EnableOrganizationDomainsProtection = $true; EnableMailboxIntelligence = $true; EnableMailboxIntelligenceProtection = $false; MailboxIntelligenceProtectionAction = 'NoAction'; MailboxIntelligenceQuarantineTag = $null; EnableSpoofIntelligence = $true; AuthenticationFailAction = 'MoveToJmf'; SpoofQuarantineTag = 'DefaultFullAccessPolicy'; HonorDmarcPolicy = $true; DmarcQuarantineAction = 'Quarantine'; DmarcRejectAction = 'Reject'; PhishThresholdLevel = 2; TargetedDomainProtectionAction = 'NoAction'; TargetedDomainQuarantineTag = $null; EnableFirstContactSafetyTips = $false; EnableSimilarUsersSafetyTips = $false; EnableSimilarDomainsSafetyTips = $false; EnableUnusualCharactersSafetyTips = $false; EnableUnauthenticatedSender = $true; EnableViaTag = $true }) }
-function Get-AntiPhishRule { @([PSCustomObject]@{ Name = 'Office365 AntiPhish Default'; AntiPhishPolicy = 'Office365 AntiPhish Default'; State = 'Enabled'; Priority = 0; SentTo = @(); SentToMemberOf = @(); RecipientDomainIs = @() }) }
+function Get-AntiPhishPolicy {
+    @(
+        [PSCustomObject]@{ Name = 'Office365 AntiPhish Default'; IsDefault = $true; Enabled = $true; EnableTargetedUserProtection = $false; TargetedUsersToProtect = @(); EnableTargetedDomainsProtection = $false; TargetedDomainsToProtect = @(); ExcludedSenders = @(); ExcludedDomains = @(); TargetedUserProtectionAction = 'NoAction'; TargetedUserQuarantineTag = 'AdminOnlyAccessPolicy'; EnableOrganizationDomainsProtection = $true; EnableMailboxIntelligence = $true; EnableMailboxIntelligenceProtection = $false; MailboxIntelligenceProtectionAction = 'NoAction'; MailboxIntelligenceQuarantineTag = $null; EnableSpoofIntelligence = $true; AuthenticationFailAction = 'MoveToJmf'; SpoofQuarantineTag = 'DefaultFullAccessPolicy'; HonorDmarcPolicy = $true; DmarcQuarantineAction = 'Quarantine'; DmarcRejectAction = 'Reject'; PhishThresholdLevel = 2; TargetedDomainProtectionAction = 'NoAction'; TargetedDomainQuarantineTag = $null; EnableFirstContactSafetyTips = $false; EnableSimilarUsersSafetyTips = $false; EnableSimilarDomainsSafetyTips = $false; EnableUnusualCharactersSafetyTips = $false; EnableUnauthenticatedSender = $true; EnableViaTag = $true },
+        [PSCustomObject]@{ Name = 'Standard Preset Security Policy'; RecommendedPolicyType = 'Standard'; Enabled = $true; ExcludedSenders = @(); ExcludedDomains = @() },
+        [PSCustomObject]@{ Name = 'Evaluation Policy'; Enabled = $true; ExcludedSenders = @(); ExcludedDomains = @() },
+        [PSCustomObject]@{ Name = 'Defender for Office 365 Evaluation'; Enabled = $false; ExcludedSenders = @(); ExcludedDomains = @() },
+        [PSCustomObject]@{ Name = 'C-Level'; Enabled = $true; ExcludedSenders = @(); ExcludedDomains = @() },
+        [PSCustomObject]@{ Name = 'Baseline L1'; Enabled = $true; ExcludedSenders = @(); ExcludedDomains = @() }
+    )
+}
+function Get-AntiPhishRule {
+    @(
+        [PSCustomObject]@{ Name = 'Office365 AntiPhish Default'; AntiPhishPolicy = 'Office365 AntiPhish Default'; State = 'Enabled'; Priority = 0; SentTo = @(); SentToMemberOf = @(); RecipientDomainIs = @() },
+        [PSCustomObject]@{ Name = 'C-Level rule'; AntiPhishPolicy = 'C-Level'; State = 'Enabled'; Priority = 0; SentTo = @('exec@mockcorp.com'); SentToMemberOf = @(); RecipientDomainIs = @() },
+        [PSCustomObject]@{ Name = 'Baseline rule'; AntiPhishPolicy = 'Baseline L1'; State = 'Enabled'; Priority = 1; SentTo = @(); SentToMemberOf = @(); RecipientDomainIs = @('mockcorp.com') }
+    )
+}
 $script:FakeSpamDomains = 1..30 | ForEach-Object { "domain$_.example.com" }
 function Get-HostedContentFilterPolicy {
     $base = @{ SpamAction = 'MoveToJmf'; HighConfidenceSpamAction = 'Quarantine'; PhishSpamAction = 'Quarantine'; HighConfidencePhishAction = 'Quarantine'; BulkSpamAction = 'MoveToJmf'; BulkThreshold = 7; IncreaseScoreWithImageLinks = 'Off'; AllowedSenders = @(); BlockedSenders = @(); BlockedSenderDomains = @('bad.com'); QuarantineRetentionPeriod = 15; SpamQuarantineTag = 'DefaultFullAccessPolicy'; HighConfidenceSpamQuarantineTag = $null; PhishQuarantineTag = 'AdminOnlyAccessPolicy'; HighConfidencePhishQuarantineTag = $null; BulkQuarantineTag = $null;
@@ -244,13 +304,15 @@ function Get-AddressBookPolicy { @([PSCustomObject]@{ Name = 'All Fabrikam ABP';
 function Get-AddressList { @([PSCustomObject]@{ Name = 'All Users'; RecipientFilter = "RecipientType -eq 'UserMailbox'" }) }
 function Get-GlobalAddressList { @([PSCustomObject]@{ Name = 'Default Global Address List'; RecipientFilter = "Alias -ne `$null" }) }
 function Get-OfflineAddressBook { @([PSCustomObject]@{ Name = 'Default Offline Address Book (Ex2019)'; IsDefault = $true; AddressLists = @('\Default Global Address List') }) }
-function Get-App { param([switch]$OrganizationApp) @([PSCustomObject]@{ DisplayName = 'Report Message'; Enabled = $true; DefaultStateForUser = 'Enabled'; ProvidedTo = 'Everyone' }) }
+function Get-App { param([switch]$OrganizationApp) @([PSCustomObject]@{ DisplayName = 'Report Message'; Enabled = $true; DefaultStateForUser = 'Enabled'; ProvidedTo = 'Everyone'; AppId = 'aaaaaaaa-0000-0000-0000-000000000001'; AppVersion = '1.0.0.0' }) }
 function Get-CalendarProcessing { param($Identity) [PSCustomObject]@{ AutomateProcessing = 'AutoAccept'; BookingWindowInDays = 180; MaximumDurationInMinutes = 1440; AllowConflicts = $false; AllowRecurringMeetings = $true; ProcessExternalMeetingMessages = $false; AddOrganizerToSubject = $false; DeleteSubject = $false; AllBookInPolicy = $true } }
 function Get-ConnectionInformation { @([PSCustomObject]@{ UserPrincipalName = 'admin@mockcorp.onmicrosoft.com'; TenantID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }) }
 
 # RBAC fakes
-function Get-RoleGroup { @([PSCustomObject]@{ Name = 'Organization Management'; ManagedBy = @(); Roles = @('Mail Recipients','Mail Enabled Public Folders') }, [PSCustomObject]@{ Name = 'Help Desk'; ManagedBy = @('admin'); Roles = @('View-Only Recipients','User Options') }) }
-function Get-RoleGroupMember { param($Identity, $ErrorAction) @([PSCustomObject]@{ Name = 'Admin One' }, [PSCustomObject]@{ Name = 'Admin Two' }) }
+function Get-RoleGroup { @([PSCustomObject]@{ Name = 'Organization Management'; ManagedBy = @(); Roles = @('Mail Recipients','Mail Enabled Public Folders') }, [PSCustomObject]@{ Name = 'Help Desk'; ManagedBy = @('admin'); Roles = @('View-Only Recipients','User Options') }, [PSCustomObject]@{ Name = 'Broken Role Group'; ManagedBy = @(); Roles = @('Mail Recipients') }) }
+function Get-RoleGroupMember { param($Identity, $ErrorAction)
+    if ($Identity -eq 'Broken Role Group') { throw 'Simulated member lookup failure' }
+    @([PSCustomObject]@{ Name = 'Admin One' }, [PSCustomObject]@{ Name = 'Admin Two' }) }
 function Get-RoleAssignmentPolicy { @([PSCustomObject]@{ Name = 'Default Role Assignment Policy'; IsDefault = $true; AssignedRoles = @([PSCustomObject]@{ Name = 'MyBaseOptions' }, [PSCustomObject]@{ Name = 'MyContactInformation' }) }) }
 function Get-ManagementRole { @([PSCustomObject]@{ Name = 'Custom Role 1'; Parent = 'Mail Recipients'; RoleType = 'MailRecipients'; IsEndUserRole = $false; IsRootRole = $false }) }
 function Get-ManagementRoleAssignment { param($RoleAssigneeType, $ErrorAction) @([PSCustomObject]@{ Role = 'Mail Recipients'; RoleAssigneeName = 'Admin One'; AssignmentMethod = 'Direct'; CustomRecipientWriteScope = $null; RecipientAdministrativeUnitScope = $null; App = $null; RoleAssignee = $null; RoleAssigneeType = 'User'; CustomResourceScope = $null }) }
@@ -270,15 +332,16 @@ function Get-RetentionCompliancePolicy {
         [PSCustomObject]@{ Name = 'Broken policy'; Mode = 'Enforce'; Enabled = $false; ExchangeLocation = @('All') }
     )
 }
-function Get-RetentionComplianceRule { param($Policy)
+function Get-RetentionComplianceRule { param($Policy, $WarningAction)
     if ($Policy -eq 'Broken policy') { throw 'Simulated retention rule failure' }
     @([PSCustomObject]@{ Name = 'Keep 3y'; PublishComplianceTag = 'Label A'; RetentionDuration = '1095'; ExpirationDateOption = 'CreationAgeInDays'; RetentionComplianceAction = 'Keep' })
 }
-function Get-DlpCompliancePolicy { @([PSCustomObject]@{ Name = 'PII DLP'; Mode = 'Enable'; Enabled = $true; ExchangeLocation = @('All'); ExchangeLocationException = @() }) }
-function Get-DlpComplianceRule { param($Policy, $ErrorAction)
+function Get-DlpCompliancePolicy { @([PSCustomObject]@{ Name = 'PII DLP'; Mode = 'Enable'; Enabled = $true; ExchangeLocation = @('All'); ExchangeLocationException = @() }, [PSCustomObject]@{ Name = 'NoExo DLP'; Mode = 'Enable'; Enabled = $true; ExchangeLocation = $null; ExchangeLocationException = @() }) }
+function Get-DlpComplianceRule { param($Policy, $ErrorAction, $WarningAction)
     @(
         [PSCustomObject]@{ Name = 'Rule A'; BlockAccess = $true; NotifyUser = @('SiteAdmin'); GenerateAlert = @('All'); GenerateIncidentReport = @(); Disabled = $false },
-        [PSCustomObject]@{ Name = 'Rule B'; BlockAccess = $false; NotifyUser = @(); GenerateAlert = @(); GenerateIncidentReport = @(); Disabled = $true }
+        [PSCustomObject]@{ Name = 'Rule B'; BlockAccess = $false; NotifyUser = @(); GenerateAlert = @(); GenerateIncidentReport = @(); Disabled = $true },
+        [PSCustomObject]@{ Name = 'Rule C'; BlockAccess = $false; NotifyUser = $null; GenerateAlert = $null; GenerateIncidentReport = $null; Disabled = $false }
     )
 }
 function Get-ComplianceTag { @([PSCustomObject]@{ Name = 'Keep 10y'; RetentionAction = 'Keep'; RetentionDuration = '3650'; RetentionType = 'CreationAgeInDays'; IsRecordLabel = $true; EventType = $null; Notes = 'Legal hold' }) }
@@ -322,6 +385,7 @@ $pass = 0; $fail = 0
 function Check { param([bool]$Cond, [string]$Name)
     if ($Cond) { $script:pass++; "  [PASS] $Name" } else { $script:fail++; "  [FAIL] $Name" }
 }
+Check ($paramViolations.Count -eq 0) "static parameter-name check$(if ($paramViolations) { ': ' + ($paramViolations -join '; ') })"
 
 # 1. max table columns <= 4 on every '|' line
 $badTables = @($script:Report.ToString() -split "`r?`n" | Where-Object { $_ -match '^\s*\|' } | Where-Object {
@@ -344,7 +408,7 @@ Check (@($script:CollectionLog | Where-Object { $_.Section -eq 'TransportConfig'
 
 # 6. CSV files match appendix index
 $csvFiles = @(Get-ChildItem $csvDir -Filter *.csv | ForEach-Object { $_.Name })
-$indexFiles = @($script:CsvIndex.Values | Where-Object { $_.File -ne 'none' } | ForEach-Object { $_.File })
+$indexFiles = @($script:CsvIndex.Values | Where-Object { $_.File -ne 'none' -and $_.File -ne 'not collected (lookup failed)' } | ForEach-Object { $_.File })
 $missingOnDisk = @($indexFiles | Where-Object { $_ -notin $csvFiles })
 $missingInIndex = @($csvFiles | Where-Object { $_ -notin $indexFiles })
 Check ($missingOnDisk.Count -eq 0 -and $missingInIndex.Count -eq 0) "CSV files match appendix index (onDisk=$($csvFiles.Count) inIndex=$($indexFiles.Count) missingOnDisk=$($missingOnDisk -join ',') missingInIndex=$($missingInIndex -join ','))"
@@ -352,20 +416,27 @@ $noneCount = @($script:CsvIndex.Values | Where-Object { $_.File -eq 'none' }).Co
 Check ($noneCount -gt 0) "empty datasets appear as 'none' in index ($noneCount entries)"
 
 # ---- Policy status/scope checks (Get-PolicyRuleInfo) ----------------------
-Check ($md -match '\| Default \| On \(default policy\) \|') "Default anti-spam shows 'On (default policy)'"
-$defAll = ($md -match 'On \(default policy\)[^\r\n]*\| All recipients') -or ($md -match 'Applies to \| All recipients')
+Check ($md -match '\| Default \| Always on \|') "Default anti-spam shows 'Always on'"
+$defAll = ($md -match 'Always on[^\r\n]*\| All recipients') -or ($md -match 'Applies to \| All recipients')
 Check $defAll "Default applies to 'All recipients'"
-Check ($md -match '\| Custom Contoso \| Enabled \|') "custom policy shows 'Enabled'"
+Check ($md -match '\| Custom Contoso \| On \|') "custom policy shows 'On'"
 Check ($md -match 'Domains: contoso\.eu \(with exclusions\)') "custom policy 'Domains: contoso.eu (with exclusions)'"
 Check ($md -match '\| Excluded users \| user@contoso\.eu \|') "card has 'Excluded users | user@contoso.eu'"
-Check ($md -match '\| Disabled Scoped \| Disabled \|') "disabled policy shows 'Disabled'"
+Check ($md -match '\| Disabled Scoped \| Off \|') "disabled policy shows 'Off'"
 Check ($md -match '1 group\(s\)') "disabled policy scoped to '1 group(s)'"
-Check ($md -match '\| Standard Preset Security Policy \| Enabled \|') "preset policy shows 'Enabled'"
+Check ($md -match '\| Standard Preset Security Policy \| On \| Preset \(after Strict\) \|') "preset policy shows 'On' + 'Preset (after Strict)'"
 Check ($md -match '\| Included senders \| ext\.sender@mockcorp\.com \|') "outbound shows 'Included senders'"
 Check ($md -match '\| Built-In Protection Policy \| On \(built-in protection\) \|') "built-in shows 'On (built-in protection)'"
 Check ($md -match 'All recipients \(with exclusions\)') "built-in applies 'All recipients (with exclusions)'"
 $secSegment = ($md -split '## Anti-phishing policies', 2)[1] -split '## Tenant Allow/Block List', 2 | Select-Object -First 1
 Check (@(($secSegment -split "`r?`n") -match '^\| Enabled \|').Count -eq 0) "no remaining '| Enabled |' rows in policy cards"
+Check ($secSegment -match '\| Evaluation Policy \| On - audit only \(Defender for Office 365 evaluation') "evaluation (Enabled) shows 'On - audit only'"
+Check ($secSegment -match '\| Defender for Office 365 Evaluation \| Off \(Defender for Office 365 evaluation\) \|') "evaluation (disabled) shows 'Off (Defender for Office 365 evaluation)'"
+Check ($secSegment -match '\| C-Level \| On \| 0 \|') "custom C-Level shows 'On' priority 0"
+Check ($secSegment -match '\| Office365 AntiPhish Default \| Always on \| Lowest \|') "anti-phish default shows 'Always on' 'Lowest'"
+$iStd = $secSegment.IndexOf('| Standard Preset Security Policy |'); $iEval = $secSegment.IndexOf('| Evaluation Policy |')
+$iC = $secSegment.IndexOf('| C-Level |'); $iB = $secSegment.IndexOf('| Baseline L1 |'); $iDef = $secSegment.IndexOf('| Office365 AntiPhish Default |')
+Check ($iStd -ge 0 -and $iEval -gt $iStd -and $iC -gt $iEval -and $iB -gt $iC -and $iDef -gt $iB) "anti-phish order: preset -> evaluation -> custom p0 -> custom p1 -> default"
 $spamCsv = Get-Content (Join-Path $csvDir 'AntiSpamInboundPolicies.csv') -TotalCount 1
 Check ($spamCsv -match 'ExcludedUsers' -and $spamCsv -match 'ExcludedDomains') "anti-spam CSV has Excluded* columns"
 $slCsv = Get-Content (Join-Path $csvDir 'SafeLinksPolicies.csv') -TotalCount 1
@@ -398,7 +469,11 @@ Check ($md -match 'Basic authentication allowed for') "auth policy 'Basic authen
 Check ($md -match '\| Roles \| Mail Recipients, Mail Enabled Public Folders \|' -or $md -match '\| Roles \| .*Mail Recipients') "role group 'Roles' row lists roles"
 Check ($md -match '## Mailbox plans \(defaults for new mailboxes\)') "Mailbox plans section exists"
 Check ($md -match '## Address lists and address book policies') "Address lists section exists"
-Check ($md -match '## Outlook add-ins deployed by the organization') "Outlook add-ins section exists"
+Check ($md -match '## Outlook add-ins in the Exchange organization catalog') "renamed organization catalog section exists"
+Check ($md -match 'no longer shown in any admin portal') "catalog note text renders"
+Check (@($script:CsvData['OrganizationApps'] | Where-Object { $_.AppId }).Count -ge 1) "OrganizationApps CSV rows carry AppId"
+Check ($md -match '_Skipped - run with -IncludeIntegratedApps') "Integrated apps shows Skipped line by default"
+Check ($script:CsvIndex['IntegratedApps'].Contents -match 'skipped') "IntegratedApps index notes 'skipped'"
 Check ($md -match '## Public folders') "Public folders section exists"
 Check ($md -match '## Room calendar processing') "Room calendar processing section exists"
 Check ($md -match '\| DKIM selector 1 CNAME in DNS \| Published \(matches\) \|') "DKIM 'Published (matches)'"
@@ -441,6 +516,32 @@ Check ($md -match '### SecOps mailboxes' -and $md -match '### Phishing simulatio
 Check ($md -match '### Device access rules') "'### Device access rules' heading"
 Check ($md -match '0 \(service default\)') "outbound spam '0 (service default)'"
 Check ($md -match '\| Mailbox quota \|') "ProhibitSendReceiveQuota header 'Mailbox quota'"
+
+# ---- v1.2 regression checks ------------------------------------------------
+Check ($md -match '\| Inbound no EF \| Partner \| Yes \| Off \|') "null EFSkipIPs -> Enhanced Filtering 'Off' in overview"
+$noEfCard = ($md -split '### Inbound no EF', 2)[1]
+Check ($noEfCard -match '\| Enhanced Filtering \| Off \|') "null EFSkipIPs -> Enhanced Filtering 'Off' in card"
+Check ($md -match 'POP enabled / disabled \| 1 / 1 / not set 1') "POP counts show 'not set 1'"
+Check ($md -match '\| DKIM selector 1 CNAME in DNS \| Published \(target: selector1-nodkim-com') "DKIM without config shows 'Published (target: ...)'"
+Check ($md -match 'Unknown \(member lookup failed\)') "role group 'Unknown (member lookup failed)'"
+Check ($md -match '### Broken Role Group') "card rendered for group with failed member lookup"
+Check ($md -match '\| Members \| Unknown \(member lookup failed\) \|') "failed group card has 'Members | Unknown (member lookup failed)'"
+Check ($md -match 'Rule C: no actions') "DLP rule with null action props -> 'no actions'"
+Check ($md -notmatch 'NoExo DLP') "DLP policy with null ExchangeLocation not listed"
+Check (@($script:CsvIndex.Keys | Where-Object { $_ -eq 'TenantAllowBlockList' }).Count -eq 1 -and $script:CsvIndex['TenantAllowBlockList'].Rows -eq 1) "TenantAllowBlockList CSV index single entry with full row count"
+$nodkimCard = ($md -split '### nodkim\.com', 2)[1]
+Check ($nodkimCard -match '\| MX points to EXO \| Yes \|') "mx.microsoft MX host -> 'MX points to EXO' Yes"
+Check ($md -match 'mockcorp-com\.mail\.protection\.outlook\.com' -and ($md -split '### mockcorp\.com', 2)[1] -match '\| MX points to EXO \| Yes \|') "mail.protection MX host still Yes"
+Check ($md -match '\| EWS application access policy \| Allow list enforced \(only listed applications allowed\) \|') "EWS EnforceAllowList renders portal text"
+Check ($md -match '\| EWS blocked applications \| BadApp1, BadApp2 \|') "EWS block list renders"
+Check ($md -match '\| Mailboxes with audit disabled \| 1 \|') "audit disabled count excludes null AuditEnabled"
+Check ($md -match '\| Mailboxes with audit not reported \| 1 \|') "'audit not reported' row shows 1"
+Check ($md -match '## Mailboxes with forwarding' -and $md -match '\| Shared Info \| fwd@partner\.com \| Yes \| Yes \|') "forwarding row shows external target + keep copy"
+Check ($md -match '\| Name \| Forwards to \| External \| Keeps a copy \|') "forwarding overview header humanised"
+$miUnnamed = Get-RoleGroupMemberInfo -Members @([PSCustomObject]@{})
+Check ($miUnnamed.Users -contains 'Unnamed member') "memberless object -> 'Unnamed member'"
+Check ($md -match '\(multiple SPF records - invalid\)') "two SPF records flagged invalid"
+Check ($md -match '2 records found - invalid') "two DMARC records flagged invalid"
 
 # ---- A1 second pass: rule lookup failure ------------------------------------
 $script:Report = [System.Text.StringBuilder]::new()
@@ -504,9 +605,12 @@ $script:Mailboxes = $null; $script:CasMailboxes = $null; $script:DistGroups = $n
 $script:DynGroups = $null; $script:M365Groups = $null; $script:InboundConnectors = $null
 $script:OutboundConnectors = $null; $script:TransportRules = $null
 $script:DirObjCache = $null; $script:SpCache = $null
+$script:MailboxesError = $null; $script:CasMailboxesError = $null; $script:DistGroupsError = $null
+$script:DynGroupsError = $null; $script:M365GroupsError = $null; $script:InboundConnectorsError = $null
+$script:OutboundConnectorsError = $null; $script:TransportRulesError = $null; $script:TransportConfigError = $null
 function Get-EOPProtectionPolicyRule { @([PSCustomObject]@{ Name = 'Standard Preset Security Policy'; State = 'Enabled'; Priority = 0; SentTo = @(); SentToMemberOf = @(); RecipientDomainIs = @(); HostedContentFilterPolicy = 'Standard Preset Security Policy' }) }
 function Get-HostedContentFilterPolicy { @(
-    [PSCustomObject]@{ Name = 'Asf policy'; IsDefault = $false; Enabled = $true; SpamAction = 'MoveToJmf'; IncreaseScoreWithImageLinks = 'On'; MarkAsSpamBulkMail = 'Test' },
+    [PSCustomObject]@{ Name = 'Asf policy'; IsDefault = $false; Enabled = $true; SpamAction = 'MoveToJmf'; IncreaseScoreWithImageLinks = 'On'; MarkAsSpamEmptyMessages = ''; MarkAsSpamBulkMail = 'Test' },
     [PSCustomObject]@{ Name = 'Standard Preset Security Policy'; IsDefault = $false; Enabled = $true; RecommendedPolicyType = 'Standard'; SpamAction = 'MoveToJmf' }
 ) }
 function Get-HostedContentFilterRule { @([PSCustomObject]@{ Name = 'Asf policy'; HostedContentFilterPolicy = 'Asf policy'; State = 'Enabled'; Priority = 1; SentTo = @('u@mockcorp.com'); SentToMemberOf = @(); RecipientDomainIs = @() }) }
@@ -514,7 +618,7 @@ function Get-PhishSimOverridePolicy { @([PSCustomObject]@{ Name = 'PhishSimOverr
 function Get-ExoPhishSimOverrideRule { @([PSCustomObject]@{ Name = 'PhishSim rule'; Policy = 'aaaa0000-1111-2222-3333-444455556666'; Domains = @('phishsim.example.com'); SenderIpRanges = @('10.0.0.1') }) }
 function Get-LabelPolicy { @([PSCustomObject]@{ Name = 'LP1'; Enabled = $true; ExchangeLocation = @(); ModernGroupLocation = @('sg-mock@mockcorp.com'); ExchangeLocationException = @(); ModernGroupLocationException = @() }) }
 function Get-ComplianceTag { @([PSCustomObject]@{ Name = 'Keep 3y'; Guid = 'bbbb0000-1111-2222-3333-444455556666'; RetentionAction = 'Keep'; RetentionDuration = '1095'; RetentionType = 'CreationAgeInDays'; IsRecordLabel = $false }) }
-function Get-RetentionComplianceRule { param($Policy)
+function Get-RetentionComplianceRule { param($Policy, $WarningAction)
     if ($Policy -eq 'Broken policy') { throw 'Simulated retention rule failure' }
     @([PSCustomObject]@{ Name = 'Pub rule'; PublishComplianceTag = 'bbbb0000-1111-2222-3333-444455556666'; RetentionDuration = '1095'; ExpirationDateOption = 'CreationAgeInDays'; RetentionComplianceAction = 'Keep' })
 }
@@ -553,7 +657,7 @@ $md5 = $script:Report.ToString()
 $presetSeg = ($md5 -split '### Standard Preset Security Policy', 2)[1]
 Check ($presetSeg -match '\| Applies to \| All recipients \|') "A1 preset rule without conditions -> 'All recipients'"
 $evalInfo = Get-PolicyRuleInfo -Policy ([PSCustomObject]@{ Name = 'Evaluation Policy'; Enabled = $true }) -PresetRules @() -BuiltInRules @()
-Check ($evalInfo.Kind -eq 'Evaluation' -and $evalInfo.Status -eq 'Not in use (evaluation policy)' -and $evalInfo.AppliesTo -eq 'Not applicable' -and $null -eq $evalInfo.Priority) "B4 'Evaluation Policy' -> 'Not in use (evaluation policy)'"
+Check ($evalInfo.Kind -eq 'Evaluation' -and $evalInfo.Status -match 'On - audit only' -and $evalInfo.AppliesTo -match 'Evaluation scope' -and $evalInfo.Priority -eq 'Not applicable') "B4 'Evaluation Policy' -> 'On - audit only'"
 Check ($md5 -match 'phishsim\.example\.com') "A2 PhishSim rule matched via GUID shows domains"
 Check ($md5 -match 'Published to users and groups \| sg-mock@mockcorp\.com') "A3 ModernGroupLocation under 'Published to users and groups'"
 Check ($md5 -match 'Public folder mailboxes \| 2') "A4 'Public folder mailboxes | 2'"
@@ -571,6 +675,233 @@ Check ($md5 -match "Move message to the recipients' Junk Email folders") "B1 thr
 Check ($md5 -match 'Image links to remote sites') "B2 ASF 'On' -> portal name"
 Check ($md5 -match 'Mark bulk email as spam \(test\)') "B2 ASF 'Test' -> 'name (test)'"
 Check ($md5 -match '0 \(service default\)') "B7 '0 (service default)' in new pass"
+Check ($md5 -match 'settings turned on \| Image links to remote sites, Mark bulk email as spam \(test\)') "ASF empty-string property not listed"
+
+# ---- Invoke-ExoProxy unit tests -------------------------------------------
+$script:ExoProxyCommands = @{ 'FakeFails' = 'FakeFails'; 'FakeErrors' = 'FakeErrors' }
+function FakeFails { [CmdletBinding()] param() $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new([Exception]::new('normal failure'), 'FakeErr', 'NotSpecified', $null)) }
+function FakeErrors { [CmdletBinding()] param() $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new([Exception]::new('normal failure'), 'FakeErr', 'NotSpecified', $null)); 'partial-object' }
+$threw = $false
+try { $null = & { $ErrorActionPreference = 'Continue'; Invoke-ExoProxy 'FakeFails' } } catch { $threw = $true }
+Check $threw "Invoke-ExoProxy throws on non-403 non-terminating error"
+function FakeErrorsWrap { Invoke-ExoProxy 'FakeErrors' @args }
+$threw = $false; $r = $null
+try { $r = & { $ErrorActionPreference = 'Continue'; FakeErrorsWrap -ErrorAction SilentlyContinue } } catch { $threw = $true }
+Check ((-not $threw) -and "$r" -eq 'partial-object') "Invoke-ExoProxy honors wrapper '-ErrorAction SilentlyContinue'"
+$threw = $false; $r = $null
+try { $r = & { $ErrorActionPreference = 'Continue'; FakeErrorsWrap -ErrorAction:SilentlyContinue } } catch { $threw = $true }
+Check ((-not $threw) -and "$r" -eq 'partial-object') "Invoke-ExoProxy honors wrapper '-ErrorAction:SilentlyContinue'"
+$threw = $false
+try { $null = & { $ErrorActionPreference = 'Continue'; FakeErrorsWrap } } catch { $threw = $true }
+Check $threw "Invoke-ExoProxy throws through wrapper without -ErrorAction"
+
+# ---- Normal-pass: no unintended 'lookup failed' ---------------------------
+Check (@([regex]::Matches($md, 'Not available - lookup failed')).Count -eq 1) "only the intentional TransportConfig 'lookup failed' line in normal pass"
+Check (@([regex]::Matches($md, 'Unknown \(lookup failed\)')).Count -eq 1 -and $md -match '\| Public folder mailboxes \| Unknown \(lookup failed\) \|') "only intentional 'Unknown (lookup failed)' value in normal pass (unmocked Get-Mailbox)"
+
+# ---- CSV formula injection --------------------------------------------------
+$inj = @(ConvertTo-CsvRow -Rows @([PSCustomObject]@{ Name = '=HYPERLINK("http://x","y")'; Num = 5; On = $true; Tag = @('=a','b') }))[0]
+Check ($inj.Name.StartsWith("'=")) "CSV cell starting with '=' gets ' prefix"
+Check ($inj.Tag -eq "'=a; b") "joined list value gets ' prefix"
+Check ($inj.Num -eq 5 -and $inj.On -eq $true) "non-string CSV values untouched"
+
+# ---- Lookup-failure pass -----------------------------------------------------
+$script:Report = [System.Text.StringBuilder]::new()
+$script:CsvData = [ordered]@{}
+$script:CsvIndex = [ordered]@{}
+$script:Mailboxes = $null; $script:CasMailboxes = $null; $script:DistGroups = $null
+$script:DynGroups = $null; $script:M365Groups = $null; $script:InboundConnectors = $null
+$script:OutboundConnectors = $null; $script:TransportRules = $null; $script:AcceptedDomains = $null
+$script:TransportConfig = $null; $script:DkimConfig = $null; $script:DirObjCache = $null; $script:SpCache = $null
+$script:SpCacheFailed = $false
+$script:MailboxesError = $null; $script:CasMailboxesError = $null; $script:DistGroupsError = $null
+$script:DynGroupsError = $null; $script:M365GroupsError = $null; $script:InboundConnectorsError = $null
+$script:OutboundConnectorsError = $null; $script:TransportRulesError = $null; $script:TransportConfigError = $null
+$script:MbxCalls = 0
+function Get-EXOMailbox { param($ResultSize, $Properties, [switch]$InactiveMailboxOnly, [switch]$SoftDeletedMailbox, [switch]$PublicFolder)
+    if (-not $InactiveMailboxOnly -and -not $SoftDeletedMailbox) { $script:MbxCalls++ }
+    throw 'Simulated mailbox lookup failure'
+}
+function Get-EXOCASMailbox { param($ResultSize, $Properties) throw 'Simulated CAS lookup failure' }
+function Get-InboundConnector { throw 'Simulated connector failure' }
+function Get-IRMConfiguration { throw 'Simulated IRM failure' }
+function Get-AuthenticationPolicy { throw 'Simulated auth policy failure' }
+function Get-DkimSigningConfig { throw 'Simulated DKIM failure' }
+function Get-ATPProtectionPolicyRule { throw 'Simulated ATP preset failure' }
+function Get-ATPBuiltInProtectionRule { throw 'Simulated built-in failure' }
+function Get-UnifiedGroup { param($ResultSize) throw 'Simulated M365 group failure' }
+function Get-ServicePrincipal { throw 'Simulated SP failure' }
+function Get-HostedContentFilterPolicy { @(
+    [PSCustomObject]@{ Name = 'NoRule AntiSpam'; IsDefault = $false; Enabled = $true; SpamAction = 'MoveToJmf' },
+    [PSCustomObject]@{ Name = 'Asf policy'; IsDefault = $false; Enabled = $true; SpamAction = 'MoveToJmf' },
+    [PSCustomObject]@{ Name = 'Standard Preset Security Policy'; IsDefault = $false; Enabled = $true; RecommendedPolicyType = 'Standard'; SpamAction = 'MoveToJmf' }
+) }
+function Get-ManagementRoleAssignment { param($RoleAssigneeType, $ErrorAction)
+    if ($RoleAssigneeType -eq 'ServicePrincipal') {
+        @([PSCustomObject]@{ Role = 'Application Mail Read'; RoleAssigneeName = 'Contoso App'; AssignmentMethod = 'Direct'; App = 'cccc0000-1111-2222-3333-444455556666'; RoleAssignee = $null; RoleAssigneeType = 'ServicePrincipal'; CustomResourceScope = $null; RecipientAdministrativeUnitScope = $null })
+    } else { @() }
+}
+function Get-TenantAllowBlockListItems { param($ListType, $ListSubType, $ErrorAction)
+    if ($ListType -eq 'FileHash') { throw 'Simulated FileHash list failure' }
+    if ($ListType -eq 'Sender') { return @([PSCustomObject]@{ ListType = 'Sender'; Value = 'bad@evil.com'; Action = 'Block'; ExpirationDate = (Get-Date '2027-01-01'); Notes = 'phish' }) }
+    return @()
+}
+Write-TenantOverviewSection
+Write-DomainsSection
+Write-MailFlowSection
+Write-RecipientsSection
+Write-GroupsSection
+Write-ClientAccessSection
+Write-EmailSecuritySection
+Write-PermissionsSection
+Write-ComplianceSection
+$md6 = $script:Report.ToString()
+Check ($md6 -match '\| Mailboxes \(total\) \| Unknown \(lookup failed\) \|') "tenant overview 'Mailboxes (total) | Unknown (lookup failed)'"
+Check ($md6 -match '\| Dynamic distribution groups \| 1 \|') "successful lookups still show numeric counts"
+$inSeg = ($md6 -split '## Inbound connectors', 2)[1]
+Check ($inSeg -match 'Not available - lookup failed') "inbound connectors show 'Not available - lookup failed'"
+$irmSeg = ($md6 -split '## IRM and OME configuration', 2)[1]
+Check ($irmSeg -match 'Not available - lookup failed') "IRM shows 'Not available - lookup failed'"
+$apSeg = ($md6 -split '## Authentication policies', 2)[1]
+Check ($apSeg -match 'Not available - lookup failed') "authentication policies show 'Not available - lookup failed'"
+Check ($md6 -match '\| Files \| Unknown \(lookup failed\) \|') "failed TABL list shows lookup-failed count"
+Check ($md6 -match '\| URLs \| 0 \|' -or $md6 -match '\| IP addresses \| 0 \|') "other TABL lists still show numeric counts"
+Check ($md6 -match 'POP enabled / disabled \| Unknown \(lookup failed\)') "protocol counts show lookup-failed text"
+Check ($md6 -match '\| Inactive mailboxes \| Unknown \(lookup failed\) \|') "inactive mailbox count shows lookup-failed text"
+Check (@($script:CollectionLog | Where-Object { $_.Section -eq 'Mailboxes' -or $_.Section -eq 'Mailbox count' }).Count -ge 1) "mailbox failure logged"
+Check ($md6 -match '\| EOP \| Standard Preset Security Policy \|') "EOP preset row still visible when ATP fails"
+Check ($md6 -match 'Incomplete: ATP \(Defender for Office 365\) preset rules could not be read') "partial preset failure shows 'Incomplete' note"
+Check ($md6 -match '\| NoRule AntiSpam \| Not applied \(no rule\) \|') "custom anti-spam without rule unaffected by ATP/built-in failure"
+$biSeg = ($md6 -split '### Built-in protection', 2)[1]
+Check ($biSeg -match 'Not available - lookup failed') "built-in protection shows lookup-failed line"
+Check ($md6 -match '\| DKIM enabled \| Unknown \(lookup failed\) \|') "domain card 'DKIM enabled | Unknown (lookup failed)'"
+Check ($md6 -match 'Incomplete: Microsoft 365 groups could not be read') "M365 group failure shows 'Incomplete' note"
+Check ($md6 -match '\| DKIM selector 1 \| Unknown \(lookup failed\) \|') "domain card 'DKIM selector 1' shows lookup-failed text"
+Check ($md6 -match 'Service principal names could not be resolved') "RBAC SP-name failure note renders"
+$rbacSeg = (($md6 -split '## RBAC for Applications', 2)[1] -split "`n## ", 2)[0]
+Check ($rbacSeg -match '\| Contoso App \| Application Mail Read \|' -and $rbacSeg -notmatch 'Not available - lookup failed') "RBAC assignment rows still visible when SP lookup fails"
+Check ($script:MbxCalls -eq 1) "cached mailbox failure prevents repeated Get-EXOMailbox calls"
+Check ($script:CsvIndex['InboundConnectors'].File -eq 'not collected (lookup failed)') "failed dataset indexed as 'not collected (lookup failed)'"
+Check ($script:CsvIndex['Mailboxes'].File -eq 'not collected (lookup failed)') "failed Mailboxes dataset indexed as 'not collected'"
+Check ($script:CsvIndex['TenantAllowBlockList'].Contents -match 'incomplete: Files lookup failed') "TABL CSV index notes partial failure"
+Check ($script:CsvIndex['ServicePrincipals'].File -eq 'not collected (lookup failed)') "failed SP dataset indexed as 'not collected'"
+
+# ---- Markdown '<' escaping pass ----------------------------------------------
+$script:Report = [System.Text.StringBuilder]::new()
+$script:CsvData = [ordered]@{}
+$script:CsvIndex = [ordered]@{}
+$script:TransportRules = $null; $script:InboundConnectors = $null; $script:OutboundConnectors = $null
+$script:MailboxesError = $null; $script:CasMailboxesError = $null; $script:DistGroupsError = $null
+$script:DynGroupsError = $null; $script:M365GroupsError = $null; $script:InboundConnectorsError = $null
+$script:OutboundConnectorsError = $null; $script:TransportRulesError = $null; $script:TransportConfigError = $null
+function Get-RemoteDomain { @([PSCustomObject]@{ Name = 'Default <EU>'; DomainName = 'example.com'; AutoForwardEnabled = $false; AutoReplyEnabled = $true; AllowedOOFType = 'External'; TNEFEnabled = $null; CharacterSet = '<utf-8>'; DeliveryReportEnabled = $true; NDREnabled = $true; MeetingForwardNotificationEnabled = $false; NonMimeCharacterSet = $null }) }
+function Get-TransportRule { @([PSCustomObject]@{ Name = '=HYPERLINK("http://x","y")'; State = 'Enabled'; Priority = 0; Mode = 'Enforce'; Description = 'x'; SenderAddressLocation = 'Header' }) }
+Write-MailFlowSection
+$md7 = $script:Report.ToString()
+Check ($md7 -match '### Default \\<EU> \(example\.com\)') "heading escapes '<EU>'"
+Check ($md7 -match '\| Default \\<EU> \|') "overview cell escapes '<EU>'"
+Check ($md7 -match '\| MIME character set \| \\<utf-8> \|') "card value escapes '<utf-8>'"
+Check ((Format-Value 'Sales <EU>') -eq 'Sales \<EU>') "Format-Value escapes '<'"
+$trRow = @(ConvertTo-CsvRow -Rows $script:CsvData['TransportRules'])[0]
+Check ($trRow.Name.StartsWith("'=")) "mocked transport rule formula name prefixed in CSV"
+
+# ---- Integrated apps pass ----------------------------------------------------
+$script:Report = [System.Text.StringBuilder]::new()
+$script:CsvData = [ordered]@{}
+$script:CsvIndex = [ordered]@{}
+$script:Mailboxes = $null; $script:CasMailboxes = $null; $script:DistGroups = $null
+$script:DynGroups = $null; $script:M365Groups = $null; $script:InboundConnectors = $null
+$script:OutboundConnectors = $null; $script:TransportRules = $null; $script:TransportConfig = $null
+$script:MailboxesError = $null; $script:CasMailboxesError = $null; $script:DistGroupsError = $null
+$script:DynGroupsError = $null; $script:M365GroupsError = $null; $script:InboundConnectorsError = $null
+$script:OutboundConnectorsError = $null; $script:TransportRulesError = $null; $script:TransportConfigError = $null
+$script:IncludeIntegratedApps = $true
+$script:IntegratedAppsConnected = $true
+$script:IntegratedAppsError = $null
+$script:IntegratedAppsList = @(
+    [PSCustomObject]@{ DisplayName = 'Signature 365'; ProductId = 'aaaaaaaa-0000-0000-0000-000000000101' },
+    [PSCustomObject]@{ Name = 'ServiceDesk Plus'; Enabled = $true; AssignToEveryone = $false; Members = @('a@x','b@x','c@x','d@x'); ProductId = 'bbbbbbbb-0000-0000-0000-000000000102' }
+)
+$script:IntegratedAppsListError = $null
+$script:IntegratedAppsDetails = @{ 'aaaaaaaa-0000-0000-0000-000000000101' = [PSCustomObject]@{ DisplayName = 'Signature 365'; Enabled = $true; AssignToEveryone = $true; ProductId = 'aaaaaaaa-0000-0000-0000-000000000101'; ExtraDetail = 'x' } }
+$script:IntegratedAppsDetailErrors = @{ 'bbbbbbbb-0000-0000-0000-000000000102' = $(try { throw 'Simulated detail failure' } catch { $_ }) }
+Write-ClientAccessSection
+$md8 = $script:Report.ToString()
+Check ($md8 -match '\| Signature 365 \| Yes \| Everyone \|') "integrated app row renders from detail object"
+Check ($md8 -match '\| ServiceDesk Plus \| Yes \| 4 user\(s\)/group\(s\): a@x, b@x, c@x . \|') "per-item detail failure falls back to list item"
+Check (@($script:CsvData['IntegratedApps']).Count -eq 2) "IntegratedApps CSV registered with 2 rows"
+Check (@($script:CollectionLog | Where-Object { $_.Section -match 'IntegratedApps detail' }).Count -ge 1) "per-item detail failure logged"
+$unitRows = ConvertTo-IntegratedAppRows -List $script:IntegratedAppsList -Details $script:IntegratedAppsDetails
+Check (@($unitRows | Where-Object { $_.Name -eq 'Signature 365' -and $_.AssignedTo -eq 'Everyone' }).Count -eq 1) "ConvertTo-IntegratedAppRows unit test"
+$script:Report = [System.Text.StringBuilder]::new()
+$script:CsvData = [ordered]@{}
+$script:CsvIndex = [ordered]@{}
+$script:IntegratedAppsConnected = $false
+$script:IntegratedAppsError = 'Simulated'
+Write-ClientAccessSection
+$md9 = $script:Report.ToString()
+Check ($md9 -match 'Not available: Simulated') "integrated apps shows connection error"
+Check ($script:CsvIndex['IntegratedApps'].File -eq 'not collected (lookup failed)') "IntegratedApps index marks failed collection"
+$script:Report = [System.Text.StringBuilder]::new()
+$script:CsvData = [ordered]@{}
+$script:CsvIndex = [ordered]@{}
+$script:IntegratedAppsConnected = $true
+$script:IntegratedAppsError = $null
+$script:IntegratedAppsListError = $(try { throw 'Simulated list failure' } catch { $_ })
+$script:CollectionLog.Clear()
+Write-ClientAccessSection
+$md11 = $script:Report.ToString()
+Check ($md11 -match 'Not available - lookup failed') "integrated apps list failure shows lookup-failed line"
+Check (@($script:CollectionLog | Where-Object { $_.Section -eq 'IntegratedApps' }).Count -ge 1) "list failure logged"
+Check ($script:CsvIndex['IntegratedApps'].File -eq 'not collected (lookup failed)') "list failure indexed as not collected"
+$script:IntegratedAppsListError = $null
+$script:IntegratedAppsDetailErrors = @{}
+$script:IntegratedAppsDetails = @{}
+$script:IntegratedAppsList = $null
+$script:IncludeIntegratedApps = $false
+
+# ---- Get-ErrorDetail: FQEID must not duplicate the message --------------------
+$er1 = try { throw 'abc [x]' } catch { $_ }
+Check ((Get-ErrorDetail $er1) -eq 'abc [x]') "Get-ErrorDetail does not duplicate FQEID equal to message"
+$er2 = try { Get-Item -LiteralPath 'C:\__no_such_path_zzz__' -ErrorAction Stop } catch { $_ }
+Check ((Get-ErrorDetail $er2) -match 'Cannot find path .+ \[PathNotFound,Microsoft\.PowerShell\.Commands\.GetItemCommand\]') "Get-ErrorDetail still appends distinct FQEID"
+
+# ---- Scope regression: module session vars are private to the caller scope ----
+$fakeMod = New-Module -Name 'fakeAddIn' -ScriptBlock {
+    function Connect-Fake { [CmdletBinding()] param()
+        $PSCmdlet.SessionState.PSVariable.Set((New-Object System.Management.Automation.PSVariable 'fakeSess', 1, 'Private')) }
+    function Get-Fake { [CmdletBinding()] param()
+        $PSCmdlet.SessionState.PSVariable.GetValue('fakeSess') }
+} | Import-Module
+Connect-Fake
+function Get-FakeFromChild { Get-Fake }
+Check ($null -eq (Get-FakeFromChild)) "module session var invisible to child scope (why Get-OrganizationAddIn runs in main block)"
+Check ((Get-Fake) -eq 1) "module session var visible in the same scope as Connect"
+$fakeMod | Remove-Module
+
+# ---- Wrong-tenant session guard (runs last; alters module/function state) ------
+$modA = New-Module -Name 'tmpEXO_aaa' -ScriptBlock { function Get-OrganizationConfig { [PSCustomObject]@{ DisplayName = 'Our Tenant' } } }
+$modZ = New-Module -Name 'tmpEXO_zzz' -ScriptBlock { function Get-OrganizationConfig { [PSCustomObject]@{ DisplayName = 'Other Tenant' } } }
+@($modA, $modZ) | Import-Module
+function Get-ConnectionInformation {
+    @(
+        [PSCustomObject]@{ ConnectionId = 'pre'; ModuleName = 'tmpEXO_zzz'; UserPrincipalName = 'other@x'; IsEopSession = $false },
+        [PSCustomObject]@{ ConnectionId = 'ours'; ModuleName = 'tmpEXO_aaa'; UserPrincipalName = 'me@x'; IsEopSession = $false }
+    )
+}
+Register-ExoProxyWrapper -ExcludeConnectionIds @('pre')
+Check ((Get-OrganizationConfig).DisplayName -eq 'Our Tenant') "proxy wrapper binds to this script's session, not pre-existing"
+function Get-ConnectionInformation {
+    @(
+        [PSCustomObject]@{ ConnectionId = 'pre'; ModuleName = 'tmpEXO_zzz'; UserPrincipalName = 'other@x'; IsEopSession = $false },
+        [PSCustomObject]@{ ConnectionId = 'ours'; ModuleName = $null; UserPrincipalName = 'me@x'; IsEopSession = $false }
+    )
+}
+$threw = $false
+try { Register-ExoProxyWrapper -ExcludeConnectionIds @('pre') } catch { $threw = ($_.Exception.Message -match 'Could not identify the Exchange Online session') }
+Check $threw "proxy wrapper throws when this script's session module cannot be identified"
+Remove-Module tmpEXO_aaa, tmpEXO_zzz -Force -ErrorAction SilentlyContinue
+Remove-Item "function:script:Get-OrganizationConfig" -ErrorAction SilentlyContinue
 
 "=== $pass passed, $fail failed ==="
 if ($fail -gt 0) { exit 1 }

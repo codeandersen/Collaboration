@@ -10,6 +10,7 @@ The script is read-only — it never calls `Set-`/`New-`/`Remove-`/`Enable-`/`Di
 - `ExchangeOnlineManagement` module (v3) — must be installed beforehand (`Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser`)
 - Exchange Online permissions: an **Exchange Administrator** or **Global Reader** role typically covers all cmdlets. For `-IncludePurview`, the account also needs Security & Compliance (Purview) access, e.g. **Compliance Administrator** or **Global Reader** + Purview role group.
 - App-only authentication (`-AppId`/`-CertificateThumbprint`/`-Organization`) is supported for unattended runs; the app registration needs the `Exchange.ManageAsApp` permission and the appropriate Entra role.
+- For `-IncludeIntegratedApps`: the `O365CentralizedAddInDeployment` module (`Install-Module O365CentralizedAddInDeployment -Scope CurrentUser`) and a separate interactive sign-in (Global Admin); not supported with `-AppId`.
 - Some sections need additional roles or may show "Not available"/"None found" without them: address lists / address book policies (Address Lists role), Outlook add-ins (`Get-App`), room calendar processing, and priority accounts. Failures are listed in the appendix collection log.
 
 ## Usage
@@ -31,6 +32,7 @@ The script is read-only — it never calls `Set-`/`New-`/`Remove-`/`Enable-`/`Di
 | `-UserPrincipalName` | | UPN for the interactive connection |
 | `-AppId` / `-CertificateThumbprint` / `-Organization` | | App-only certificate authentication (all three required together) |
 | `-IncludePurview` | off | Also collect Security & Compliance (Purview) data |
+| `-IncludeIntegratedApps` | off | Also collect centrally deployed add-ins via `Get-OrganizationAddIn` (needs `O365CentralizedAddInDeployment` module, interactive sign-in only) |
 | `-MaxListItems` | 10 | Cap for multi-valued properties rendered in-line |
 | `-MaxTableRows` | 25 | Cap for overview tables; rest goes to CSV |
 | `-CsvDelimiter` | culture | CSV delimiter override (default: `Export-Csv -UseCulture`) |
@@ -72,7 +74,7 @@ Every dataset is exported to CSV in full — all rows, all collected properties.
 - **Mail flow** — connectors, transport rules, remote domains, journal rules, HVE accounts.
 - **Recipients** — counts and feature summary, mailbox plans, address lists and address book policies, public folders, room calendar processing.
 - **Groups** — distribution/security/dynamic/M365 groups, M365 summary, groups without owners, groups accepting external senders, room lists.
-- **Client access** — mailbox policy assignment spreads, protocol enablement, OWA/mobile/authentication policies, organization Outlook add-ins.
+- **Client access** — mailbox policy assignment spreads, protocol enablement, OWA/mobile/authentication policies, organization Outlook add-ins (Exchange catalog via `Get-App`; centrally deployed Integrated apps via `Get-OrganizationAddIn` when `-IncludeIntegratedApps`).
 - **Sharing and federation** — organization relationships, sharing policies, availability address spaces.
 - **Hybrid and migration** — on-premises organization, intra-org connectors, migration endpoints and batches.
 - **Email security** — preset policies, all EOP/Defender threat policies with status/scope, quarantine policies incl. global notification settings, Tenant Allow/Block List, advanced delivery, user-reported settings, priority accounts, Teams protection.
